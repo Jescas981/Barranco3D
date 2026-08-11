@@ -2,7 +2,10 @@ from pathlib import Path
 import argparse
 
 import cv2
+from huggingface_hub import snapshot_download
 
+
+REPO_ID = "Jescas981/Barranco3D"
 
 DATASET_DIR = Path("data/Barranco3D")
 OUTPUT_DIR = Path("frames/Barranco3D")
@@ -10,7 +13,7 @@ OUTPUT_DIR = Path("frames/Barranco3D")
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Prepare Barranco3D by extracting frames from videos."
+        description="Download and prepare Barranco3D by extracting frames from videos."
     )
 
     parser.add_argument(
@@ -34,13 +37,48 @@ def parse_args():
         help="Directory where extracted PNG frames will be stored.",
     )
 
+    parser.add_argument(
+        "--skip-download",
+        action="store_true",
+        help="Skip Hugging Face download and use the existing dataset.",
+    )
+
     return parser.parse_args()
+
+
+def download_dataset(dataset_dir: Path):
+    """
+    Download the Barranco3D dataset from Hugging Face.
+    """
+
+    print("=" * 60)
+    print("Downloading Barranco3D dataset")
+    print("=" * 60)
+
+    dataset_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    print(f"Repository : {REPO_ID}")
+    print(f"Local path : {dataset_dir.resolve()}")
+    print()
+
+    snapshot_download(
+        repo_id=REPO_ID,
+        repo_type="dataset",
+        local_dir=str(dataset_dir),
+    )
+
+    print()
+    print("Download complete.")
+    print()
 
 
 def find_videos(dataset_dir: Path):
     """
     Find all MP4 videos case-insensitively while excluding
-    the prepared/output directory.
+    the output/prepared directories.
     """
 
     videos = []
@@ -50,19 +88,27 @@ def find_videos(dataset_dir: Path):
         if not path.is_file():
             continue
 
+        # Avoid processing extracted/generated data
         if "prepared" in path.parts:
             continue
 
+        if "frames" in path.parts:
+            continue
+
+        # Case-insensitive extension check
         if path.suffix.lower() == ".mp4":
             videos.append(path)
 
     return sorted(videos)
 
 
-def get_platform(video_path: Path, dataset_dir: Path):
+def get_platform(
+    video_path: Path,
+    dataset_dir: Path,
+):
     """
-    The first directory relative to the dataset root is considered
-    the platform.
+    The first directory relative to the dataset root
+    is considered the platform.
 
     Example:
 
@@ -79,7 +125,10 @@ def get_platform(video_path: Path, dataset_dir: Path):
     return relative.parts[0]
 
 
-def create_video_prefix(video_path: Path, dataset_dir: Path):
+def create_video_prefix(
+    video_path: Path,
+    dataset_dir: Path,
+):
     """
     Generate a prefix that identifies the video.
 
@@ -122,6 +171,7 @@ def extract_frames(
         return 0
 
     video_fps = cap.get(cv2.CAP_PROP_FPS)
+
     total_frames = int(
         cap.get(cv2.CAP_PROP_FRAME_COUNT)
     )
@@ -180,8 +230,16 @@ def prepare_dataset(
     print("Preparing Barranco3D dataset")
     print("=" * 60)
 
-    print(f"Dataset directory : {dataset_dir.resolve()}")
-    print(f"Output directory  : {output_dir.resolve()}")
+    print(
+        f"Dataset directory : "
+        f"{dataset_dir.resolve()}"
+    )
+
+    print(
+        f"Output directory  : "
+        f"{output_dir.resolve()}"
+    )
+
     print(f"Extraction FPS    : {fps}")
     print()
 
@@ -259,13 +317,41 @@ def prepare_dataset(
     print("=" * 60)
     print("Preparation complete")
     print("=" * 60)
-    print(f"Videos processed : {len(videos)}")
-    print(f"Frames extracted : {total_frames}")
-    print(f"Output directory : {output_dir.resolve()}")
+
+    print(
+        f"Videos processed : {len(videos)}"
+    )
+
+    print(
+        f"Frames extracted : {total_frames}"
+    )
+
+    print(
+        f"Output directory : "
+        f"{output_dir.resolve()}"
+    )
 
 
 def main():
+
     args = parse_args()
+
+    # --------------------------------------------------
+    # 1. Download dataset
+    # --------------------------------------------------
+
+    if not args.skip_download:
+        download_dataset(
+            args.dataset_dir
+        )
+    else:
+        print(
+            "Skipping Hugging Face download."
+        )
+
+    # --------------------------------------------------
+    # 2. Extract frames
+    # --------------------------------------------------
 
     prepare_dataset(
         dataset_dir=args.dataset_dir,

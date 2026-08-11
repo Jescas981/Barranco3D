@@ -1,4 +1,7 @@
-/other
-/data
-/frames
-.vscode
+/experiments/
+**/__pycache__/
+/other/
+/data/
+/frames/
+.vscode/
+.venv/

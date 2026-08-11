@@ -82,8 +82,8 @@ def parse_args():
             "thumb_2048_url",
             "thumb_original_url",
         ],
-        default="thumb_2048_url",
-        help="Mapillary image resolution. Default: thumb_2048_url.",
+        default="thumb_original_url",
+        help="Mapillary image resolution. Default: thumb_original_url.",
     )
 
     parser.add_argument(
