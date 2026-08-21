@@ -1,4 +1,6 @@
-# Target point
+# Barranco 3D
+
+**Monument GPS coordinates**
 TARGET_LAT = -12.143334999999539
 TARGET_LON = -77.02316199999836
 
