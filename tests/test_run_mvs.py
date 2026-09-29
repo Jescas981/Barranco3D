@@ -3,13 +3,14 @@ import io
 import json
 from pathlib import Path
 import struct
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import run_mvs as m
+from lima3d import mvs as m
 
 
 def write_file(path,data=b'x'):
@@ -55,6 +56,14 @@ class MVSTests(unittest.TestCase):
                 m.run_mvs(model,images,out)
                 self.assertEqual(executed,['image_undistorter','patch_match_stereo','patch_match_stereo','stereo_fusion'])
                 m.run_mvs(model,images,out)
+                self.assertEqual(len(executed),4)
+                m.run_mvs(model,images,out,threads=8,gpu_index='3')
+                self.assertEqual(len(executed),4)
+                moved=root/'copy'
+                shutil.copytree(model,moved/'sfm')
+                shutil.copytree(images,moved/'images')
+                shutil.copytree(out,moved/'dense')
+                m.run_mvs(moved/'sfm',moved/'images',moved/'dense',threads=4,gpu_index='1')
                 self.assertEqual(len(executed),4)
                 with self.assertRaises(ValueError): m.run_mvs(model,images,out,max_image_size=800)
                 # Una salida fusionada truncada se detecta y se rehace solo fusion.

@@ -8,9 +8,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location('pipeline', Path(__file__).resolve().parents[1] / 'run_scene_coalitions.py')
-m = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from lima3d import pipeline as m
 HAS_DEPS = all(importlib.util.find_spec(p) for p in ('torch', 'h5py', 'cv2', 'pycolmap'))
 
 

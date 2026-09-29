@@ -7,8 +7,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import coalition_dense as dense
-import run_scene_coalitions as pipeline
+from lima3d import dense as dense
+from lima3d import pipeline as pipeline
 
 
 class DenseTests(unittest.TestCase):

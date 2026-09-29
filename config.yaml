@@ -1,20 +1,20 @@
 data:
   frames_root: frames
   output_root: outputs/coalitions
-  scenes: null                  # null = todas las carpetas bajo frames_root
+  scenes: null                  # null = all folders under frames_root
   platforms: [Car, Drone, Pedestrian]
   device: auto                  # auto | cpu | cuda
 
 resources:
-  bank:                         # pares + banco (GPU)
-    gpus: 1                     # número, o lista de ids: [0, 1]
-    threads: 4                  # núcleos CPU por tarea
-  sfm:                          # SfM (solo CPU)
-    workers: 0                  # coaliciones en paralelo; 0 = automático
-    threads: 6                  # threads por coalición
+  bank:                         # pairs + matching bank (GPU)
+    gpus: 1                     # count, or list of indices: [0, 1]
+    threads: 4                  # CPU cores per task
+  sfm:                          # SfM (CPU only)
+    workers: 0                  # parallel coalitions; 0 = automatic
+    threads: 6                  # threads per coalition
   mvs:                          # MVS (GPU)
-    gpus: 4                     # número, o lista de ids: [0, 1, 2, 3]
-    threads: 4                  # núcleos CPU por tarea
+    gpus: 4                     # count, or list of indices: [0, 1, 2, 3]
+    threads: 4                  # CPU cores per task
 
 mvs:
   enabled: true

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Features y SfM para todas las coaliciones de plataformas, con cachés compartidas."""
 import argparse
-from contextlib import contextmanager
 from copy import deepcopy
 import hashlib
 from itertools import combinations
 import json
 import os
 from pathlib import Path
+
+from .utils.paths import REPO_ROOT
+from .utils.io import digest, save_json, scene_lock
 import random
 import re
 import time
@@ -30,17 +32,6 @@ CACHE_IMPLEMENTATION = '1064e18ac06f324497fad9ecbe6ba2be7648621ec018577eb2afe3c2
 def cache_environment(torch_version, pycolmap_version):
     return {'schema': SCHEMA, 'code': CACHE_IMPLEMENTATION,
             'torch': torch_version, 'pycolmap': pycolmap_version}
-
-
-def digest(value):
-    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()[:20]
-
-
-def save_json(path, value):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + '.tmp')
-    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + '\n')
-    temporary.replace(path)
 
 
 def coalitions(platforms):
@@ -71,21 +62,6 @@ def inventory(scene, platforms):
             snapshot.append((name, stat.st_size, stat.st_mtime_ns))
         images[platform] = names
     return images, digest({'root': str(scene.resolve()), 'files': snapshot})
-
-
-@contextmanager
-def scene_lock(path):
-    import fcntl
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open('a') as handle:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RuntimeError(f'Otro pipeline está usando esta escena: {path}') from exc
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def resolve_sift_device(requested, cuda_compiled, cuda_available):
@@ -298,6 +274,11 @@ def ensure_matches(conf, pairs, features_path, matches_path, device):
 
 
 def reconstruct(scene, names, pairs_path, features, matches, folder, threads, seed, camera_mode):
+    with scene_lock(folder / '.sfm.lock', wait=True):
+        return _reconstruct(scene, names, pairs_path, features, matches, folder, threads, seed, camera_mode)
+
+
+def _reconstruct(scene, names, pairs_path, features, matches, folder, threads, seed, camera_mode):
     import pycolmap
     from hloc import reconstruction
     report = folder / 'result.json'
@@ -355,7 +336,7 @@ def run_scene(scene, args):
     names = sorted(name for group in images.values() for name in group)
     root = args.output_root.resolve() / scene.name / snapshot
     # Configuración + implementación + versiones: no reutilizar resultados incompatibles.
-    code_root = Path(__file__).resolve().parent
+    code_root = REPO_ROOT
     environment = cache_environment(torch.__version__, pycolmap.__version__)
     def config_id(conf):
         return digest({'environment': environment, 'config': conf})
@@ -381,7 +362,7 @@ def run_scene(scene, args):
             dense = local_key is None
             conf = None
             if dense:
-                from coalition_dense import dense_config, ensure_dense_raw, assemble_dense
+                from .dense import dense_config, ensure_dense_raw, assemble_dense
                 matcher_conf = dense_config(preset)
                 # Separar checkpoints y versiones del adaptador denso.
                 matcher_code = hashlib.sha256((code_root / 'hloc/matchers/mast3r.py').read_bytes()).hexdigest()

@@ -5,22 +5,28 @@ También es el punto de entrada de los subprocesos (--worker)."""
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
 import traceback
 from pathlib import Path
 
+from .utils.paths import REPO_ROOT
+
 try:
     from tqdm import tqdm
 except ImportError:
     tqdm = None
 
-from coalition_config import load_config
-from coalition_pipeline import (PRESETS, coalitions, digest, run_scene, save_json,
+from .config import load_config
+from .pipeline import (PRESETS, coalitions, run_scene,
                                 setup_runtime)
-from coalition_stages import (bank_preset, check_dependencies, context, sfm_worker,
+from .utils.io import digest, save_json, scene_lock
+from .stages import (bank_preset, check_dependencies, context, sfm_worker,
                               stage_pairs)
+
+from .artifacts import check_bank_request, resolve_job, reconstruction_root
 
 HEAVY = {'mast3r': 3, 'mast3r-aerialmd': 3, 'sp-sg': 2, 'sp-lg': 2, 'sift': 1}
 THREAD_VARS = ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS')
@@ -43,9 +49,11 @@ def run_worker(a):
             os.environ['CUDA_VISIBLE_DEVICES'] = ''
             for v in THREAD_VARS:
                 os.environ[v] = str(args.sfm_threads)
+            import torch
+            torch.set_num_threads(args.sfm_threads)
             save_json(Path(job['result_file']), sfm_worker(job, args.sfm_threads)[2])
         elif a.worker == 'mvs':
-            from run_mvs import run_mvs
+            from .mvs import run_mvs
             job = json.loads(Path(a.task_json).read_text())
             m = cfg.mvs  # CUDA_VISIBLE_DEVICES expone una sola GPU: para COLMAP es la 0
             run_mvs(Path(job['model']), Path(job['images']), None, colmap=m['colmap'],
@@ -77,7 +85,8 @@ def cached_result(folder):
         return result
     if result.get('status') == 'complete':
         model = folder / result.get('model_path', '')
-        if all((model / f).is_file() for f in ('cameras.bin', 'images.bin', 'points3D.bin')):
+        if all((model / f).is_file() and (model / f).stat().st_size > 0
+               for f in ('cameras.bin', 'images.bin', 'points3D.bin')):
             return result
     return None
 
@@ -118,7 +127,8 @@ def orchestrate(cfg, stages):
     log_dir, task_dir = out / '_logs', out / '_tasks'
     for d in (log_dir, task_dir):
         d.mkdir(parents=True, exist_ok=True)
-    exps = cfg.experiments
+    # Prefer the MVS-enabled alias when identical reconstructions are deduplicated.
+    exps = dict(sorted(cfg.experiments.items(), key=lambda item: not item[1].mvs))
     gpu_free, cpu_free, allowed = make_slots(cfg.res, stages)
     print(f'Etapas: {", ".join(s for s in ALL_STAGES if s in stages)} | '
           f'banco: GPU {sorted(allowed["bank"])} | mvs: GPU {sorted(allowed["mvs"])} | '
@@ -128,12 +138,13 @@ def orchestrate(cfg, stages):
     info = {}
     for scene in cfg.scenes:
         _, _, names, root = context(scene, first)
-        info[scene.name] = {'root': root, 'n': len(names)}
+        info[scene.name] = {'root': root, 'n': len(names), 'scene': scene}
 
     ready = {'gpu': [], 'cpu': []}
     running, busy, runs, failures = [], {}, {}, []
     stats = dict.fromkeys(ALL_STAGES, 0)
     waiting_bank = {}
+    expanded_runs = set()
     t0 = time.time()
 
     # ---- panel de progreso
@@ -191,7 +202,7 @@ def orchestrate(cfg, stages):
         return f'[{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}]'
 
     def cmd_for(kind, scene, exp, task_json=None):
-        cmd = [sys.executable, os.path.abspath(__file__), '--config', str(cfg.path),
+        cmd = [sys.executable, '-m', 'lima3d.scheduler', '--config', str(cfg.path),
                '--worker', kind, '--experiment', exp, '--scene', scene]
         return cmd + (['--task-json', str(task_json)] if task_json else [])
 
@@ -212,13 +223,19 @@ def orchestrate(cfg, stages):
             fail(f'{sname}/{exp}', f'falta {path}; corre build_bank_matching.py')
             return
         man = json.loads(path.read_text())
-        run_id = digest({**man['run_base'], 'threads': args.sfm_threads})
-        run_root = root / 'reconstructions' / f"{man['preset']}-{run_id}"
-        save_json(run_root / 'config.json',
-                  {**man['config'], 'experiment': exp, 'threads': args.sfm_threads})
+        check_bank_request(man, args)
+        run_root = reconstruction_root(root, man)
+        if str(run_root) in expanded_runs:
+            say(f'[CACHE] Experimento equivalente: {exp} -> {run_root.name}')
+            return
+        expanded_runs.add(str(run_root))
+        if not (run_root / 'config.json').exists():
+            save_json(run_root / 'config.json',
+                      {**man['config'], 'experiment': exp, 'threads': args.sfm_threads,
+                       'run_base': man['run_base']})
         runs[str(run_root)] = {'left': len(man['jobs']), 'summary': {}}
         for j in man['jobs']:
-            job = {**j, 'scene': man['scene'], 'run_root': str(run_root),
+            job = {**resolve_job(root, j), 'scene': str(info[sname]['scene']), 'run_root': str(run_root),
                    'seed': man['run_base']['seed'], 'camera_mode': man['run_base']['camera_mode']}
             if 'sfm' in stages:
                 submit_sfm(sname, exp, job)
@@ -226,6 +243,8 @@ def orchestrate(cfg, stages):
                 res = cached_result(run_root / job['label'])
                 if res is not None:
                     queue_mvs(sname, exp, job, res)
+                elif args.mvs:
+                    fail(f'mvs/{sname}/{exp}/{job["label"]}', 'SfM pendiente o incompleto; ejecuta build_sfm_sparser.py')
 
     def submit_sfm(sname, exp, job):
         cached = cached_result(Path(job['run_root']) / job['label'])
@@ -240,6 +259,8 @@ def orchestrate(cfg, stages):
 
         def done(ok):
             try:
+                if not ok:
+                    raise ValueError('worker SfM falló')
                 res = json.loads(Path(job['result_file']).read_text())
             except (OSError, ValueError):
                 res = {'status': 'error', 'error': 'el proceso terminó sin resultado'}
@@ -303,6 +324,7 @@ def orchestrate(cfg, stages):
             expand(sname, exp)
 
     # ---- semillas según las etapas activadas
+    pair_groups = {}
     for sname, meta in info.items():
         for exp, args in exps.items():
             preset = args.configs[0]
@@ -313,14 +335,26 @@ def orchestrate(cfg, stages):
             if 'pairs' in stages:
                 if 'bank' in stages:
                     waiting_bank[(sname, exp)] = bank
-                ready['gpu'].append(Task('pairs', f'{sname}-{exp}', 'gpu', (0, -meta['n']),
-                                         cmd_for('pairs', sname, exp),
-                                         (lambda ok, s=sname, e=exp: on_pairs(s, e, ok)),
-                                         group=(sname, 'pairs'), mode='w'))
+                pair_key = (sname, args.global_feature, args.top_k, args.sequential_window)
+                pair_groups.setdefault(pair_key, []).append(exp)
             elif 'bank' in stages:
                 ready['gpu'].append(bank)
             else:
                 expand(sname, exp)
+
+    for (sname, _, _, _), members in pair_groups.items():
+        leader = members[0]
+        def pairs_done(ok, sname=sname, members=members, leader=leader):
+            if ok:
+                root = info[sname]['root']
+                index = json.loads((root / f'bank_index-{leader}.json').read_text())
+                for exp in members[1:]:
+                    save_json(root / f'bank_index-{exp}.json', index)
+            for exp in members:
+                on_pairs(sname, exp, ok)
+        ready['gpu'].append(Task('pairs', f'{sname}-{leader}', 'gpu', (0, -info[sname]['n']),
+                                 cmd_for('pairs', sname, leader), pairs_done,
+                                 group=(sname, 'pairs'), mode='w'))
 
     # ---- bucle principal
     def runnable(task):
@@ -341,12 +375,17 @@ def orchestrate(cfg, stages):
         if cores and task.resource == 'gpu':  # solo los núcleos que le tocan a su etapa
             cores = cores[:cfg.res['mvs' if task.kind == 'mvs' else 'bank']['threads']]
         env = os.environ.copy()
+        # Workers must find both the src package and the repository's HLoc checkout.
+        env['PYTHONPATH'] = os.pathsep.join(
+            [str(REPO_ROOT), env.get('PYTHONPATH', '')])
         if gpu is not None:
-            env['CUDA_VISIBLE_DEVICES'] = str(gpu)
+            visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+            ids = visible.split(',') if visible is not None else None
+            env['CUDA_VISIBLE_DEVICES'] = ids[gpu] if ids is not None else str(gpu)
         pin = (lambda: os.sched_setaffinity(0, cores)) if cores else None
         with (log_dir / f'{task.kind}-{task.name}.log').open('a') as log:
             proc = subprocess.Popen(task.cmd, env=env, stdout=log,
-                                    stderr=subprocess.STDOUT, preexec_fn=pin)
+                                    stderr=subprocess.STDOUT, preexec_fn=pin, start_new_session=True)
         if task.group:
             busy[task.group] = -1 if task.mode == 'w' else busy.get(task.group, 0) + 1
         running.append((proc, task, slot))
@@ -391,11 +430,25 @@ def orchestrate(cfg, stages):
                     say(f'{stamp()} sfm hechos: {stats["sfm"]}  mvs hechos: {stats["mvs"]}')
             refresh()
             time.sleep(0.5)
-    except KeyboardInterrupt:
+    except BaseException:
+        # Cancelar también hijos (COLMAP/DataLoader) y esperar antes de soltar locks.
         for proc, _, _ in running:
-            proc.terminate()
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+        for proc, _, _ in running:
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
         close_bars()
-        raise SystemExit('Interrumpido; relanza para reanudar (todo está cacheado)')
+        raise
 
     close_bars()
     print(f'\nPares {stats["pairs"]} | bancos {stats["bank"]} | SfM {stats["sfm"]} | '
@@ -417,6 +470,27 @@ def describe(cfg, stages):
         run_scene(scene, first)
 
 
+def validate_active_gpus(cfg, stages):
+    required = set()
+    if stages & {'pairs', 'bank'} and any(a.device != 'cpu' for a in cfg.experiments.values()):
+        required.update(cfg.res['bank_ids'])
+    if 'mvs' in stages and any(a.mvs for a in cfg.experiments.values()):
+        required.update(cfg.res['mvs_ids'])
+    if not required:
+        return
+    try:
+        result = subprocess.run(['nvidia-smi', '--query-gpu=index', '--format=csv,noheader'],
+                                check=True, capture_output=True, text=True)
+        available = len(result.stdout.splitlines())
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError('No se detectan GPU NVIDIA para la etapa seleccionada') from exc
+    visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if visible is not None:
+        available = 0 if visible in ('', '-1') else min(available, len(visible.split(',')))
+    if any(g >= available for g in required):
+        raise ValueError(f'GPU configuradas {sorted(required)}; hay {available} GPU visibles. Ajusta resources de esta etapa')
+
+
 def main(stages, description=None):
     stages = frozenset(stages)
     p = argparse.ArgumentParser(description=description)
@@ -431,7 +505,10 @@ def main(stages, description=None):
         return
     if stages & {'pairs', 'bank'}:
         check_dependencies([e.configs[0] for e in cfg.experiments.values()])
-    sys.exit(1 if orchestrate(cfg, stages) else 0)
+    validate_active_gpus(cfg, stages)
+    with scene_lock(cfg.output_root / '.scheduler.lock'):
+        failures = orchestrate(cfg, stages)
+    sys.exit(1 if failures else 0)
 
 
 if __name__ == '__main__':  # modo worker

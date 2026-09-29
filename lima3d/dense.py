@@ -67,6 +67,15 @@ def ensure_dense_raw(conf, scene, pairs, path, device):
 
 
 def assemble_dense(raw_path, pairs, names, folder, max_keypoints, cell_size=1.0):
+    from .utils.io import digest, scene_lock
+    identifier = digest({'pairs': sorted(set(pairs)), 'names': sorted(set(names)),
+                         'max_keypoints': max_keypoints, 'cell_size': cell_size,
+                         'adapter': DENSE_VERSION})
+    with scene_lock(folder / identifier / '.assembly.lock', wait=True):
+        return _assemble_dense(raw_path, pairs, names, folder, max_keypoints, cell_size)
+
+
+def _assemble_dense(raw_path, pairs, names, folder, max_keypoints, cell_size=1.0):
     """Cuantiza correspondencias SOLO de esta coalición; nunca usa pares externos.
 
     Una imagen por vez en memoria. Cada celda de 1 px es un keypoint; se
@@ -75,7 +84,7 @@ def assemble_dense(raw_path, pairs, names, folder, max_keypoints, cell_size=1.0)
     import h5py
     import numpy as np
     from hloc.utils.parsers import names_to_pair
-    from run_scene_coalitions import digest, save_json
+    from .utils.io import digest, save_json
     if max_keypoints < 1 or cell_size <= 0:
         raise ValueError('max_keypoints y cell_size deben ser positivos')
     pairs = sorted(set(pairs))

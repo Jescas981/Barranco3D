@@ -3,7 +3,7 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 
-from coalition_pipeline import PRESETS, build_parser, validate
+from .pipeline import PRESETS, build_parser, validate
 
 TOP = {'data', 'resources', 'mvs', 'defaults', 'experiments'}
 DATA = {'frames_root', 'output_root', 'scenes', 'platforms', 'device'}
@@ -19,7 +19,7 @@ CHOICES = {'global_feature': ['netvlad', 'openibl', 'megaloc', 'dir'],
 
 
 def _section(value, allowed, where):
-    value = value or {}
+    value = {} if value is None else value
     if not isinstance(value, dict):
         raise ValueError(f'config: {where} debe ser un mapa')
     extra = set(value) - allowed
@@ -29,9 +29,11 @@ def _section(value, allowed, where):
 
 
 def _gpu_ids(value, where):
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (int, list)):
         raise ValueError(f'config: {where}.gpus inválido')
-    ids = list(range(value)) if isinstance(value, int) else [int(g) for g in value]
+    if isinstance(value, list) and any(type(g) is not int for g in value):
+        raise ValueError(f'config: {where}.gpus debe contener enteros')
+    ids = list(range(value)) if isinstance(value, int) else value
     if not ids or len(set(ids)) != len(ids) or min(ids) < 0:
         raise ValueError(f'config: {where}.gpus debe ser un número > 0 o una lista de ids únicos')
     return ids
@@ -58,7 +60,7 @@ def load_config(path, only_experiments=None, only_scenes=None, dry_run=False):
            'num_sources': 10, **_section(raw.get('mvs'), MVS, 'mvs')}
     defaults = _section(raw.get('defaults'), OPTIONS, 'defaults')
     entries = raw.get('experiments')
-    if not entries:
+    if not isinstance(entries, list) or not entries:
         raise ValueError('config: falta la lista experiments')
     if data.get('device', 'auto') not in CHOICES['device']:
         raise ValueError('config: data.device debe ser auto, cpu o cuda')
@@ -83,17 +85,21 @@ def load_config(path, only_experiments=None, only_scenes=None, dry_run=False):
             continue
 
         ns = parser.parse_args([])                     # valores por defecto del pipeline
-        ns.frames_root = Path(data.get('frames_root', 'frames'))
-        ns.output_root = Path(data.get('output_root', 'outputs/coalitions'))
+        ns.frames_root = (path.parent / data.get('frames_root', 'frames')).resolve()
+        ns.output_root = (path.parent / data.get('output_root', 'outputs/coalitions')).resolve()
         ns.scenes = list(only_scenes) if only_scenes else data.get('scenes')
+        if ns.scenes is not None and (not isinstance(ns.scenes, list) or not ns.scenes):
+            raise ValueError('config: scenes debe ser null o una lista no vacía')
         ns.platforms = data.get('platforms', ns.platforms)
+        if not isinstance(ns.platforms, list) or not ns.platforms:
+            raise ValueError('config: platforms debe ser una lista no vacía')
         ns.device = data.get('device', 'auto')
         ns.configs = [preset]
         for key in OPTIONS - {'mvs'}:
             if key in merged:
                 setattr(ns, key, merged[key])
         ns.threads = res['bank']['threads']            # pares, banco y SIFT
-        ns.sfm_threads = res['sfm']['threads']         # forma parte del run_id del SfM
+        ns.sfm_threads = res['sfm']['threads']         # recurso de ejecución; no cambia el run_id
         ns.experiment = name
         ns.mvs = bool(merged.get('mvs', mvs['enabled']))
         ns.dry_run = dry_run
@@ -107,4 +113,4 @@ def load_config(path, only_experiments=None, only_scenes=None, dry_run=False):
     if not experiments:
         raise ValueError('config: ningún experimento seleccionado')
     return SimpleNamespace(path=path, scenes=scenes, experiments=experiments, res=res, mvs=mvs,
-                           output_root=Path(data.get('output_root', 'outputs/coalitions')).resolve())
+                           output_root=(path.parent / data.get('output_root', 'outputs/coalitions')).resolve())

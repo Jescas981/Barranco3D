@@ -6,18 +6,20 @@ import os
 from copy import deepcopy
 from pathlib import Path
 
-from coalition_pipeline import (PRESETS, cache_environment, coalitions, digest,
-    ensure_features, ensure_matches, inventory, reconstruct, retrieval_pairs,
-    save_json, scene_lock, sequential_pairs)
+from .utils.paths import REPO_ROOT
 
-CODE_ROOT = Path(__file__).resolve().parent
+from .pipeline import (PRESETS, cache_environment, coalitions,
+    ensure_features, ensure_matches, inventory, reconstruct, retrieval_pairs,
+    sequential_pairs)
+from .utils.io import digest, save_json, scene_lock
+
+from .artifacts import portable_context, artifact_ref, artifact_path, request_spec
+
+CODE_ROOT = REPO_ROOT
 
 
 def context(scene, args):
-    images, snapshot = inventory(scene, args.platforms)
-    names = sorted(n for g in images.values() for n in g)
-    root = args.output_root.resolve() / scene.name / snapshot
-    return images, snapshot, names, root
+    return portable_context(scene, args)
 
 
 def environment():
@@ -58,7 +60,6 @@ def stage_pairs(scene, args):
     env = environment()
     with scene_lock(root.parent / '.pairs.lock'):
         root.mkdir(parents=True, exist_ok=True)
-        save_json(root / 'dataset.json', {'scene': str(scene), 'snapshot': snapshot, 'images': images})
         gconf = deepcopy(extract_features.confs[args.global_feature])
         gid = config_id(env, gconf)
         gpath = root / 'features' / f'global-{gid}.h5'
@@ -67,6 +68,7 @@ def stage_pairs(scene, args):
 
         rid = digest({'global': gid, 'top_k': args.top_k, 'sequential_window': args.sequential_window})
         pair_root = root / 'pairs' / rid
+        retrieval_root = root / 'retrieval' / digest({'global': gid, 'top_k': args.top_k})
         index = {'global_conf': gconf, 'retrieval_id': rid, 'coalitions': {}}
         union = set()
         for combo in coalitions(args.platforms):
@@ -79,14 +81,21 @@ def stage_pairs(scene, args):
                 if any(len(p) != 2 or not set(p) <= allowed for p in pairs):
                     raise ValueError(f'Caché de pares inválida: {pair_path}')
             else:
-                pairs = retrieval_pairs(gpath, members, args.top_k, args.query_batch, args.database_batch)
+                retrieval_path = retrieval_root / f'{label}.txt'
+                if retrieval_path.exists():
+                    pairs = read_pairs(retrieval_path)
+                    if any(len(p) != 2 or not set(p) <= set(members) for p in pairs):
+                        raise ValueError(f'Retrieval inválido: {retrieval_path}')
+                else:
+                    pairs = retrieval_pairs(gpath, members, args.top_k, args.query_batch, args.database_batch)
+                    write_pairs(retrieval_path, pairs)
                 pairs = sorted(set(pairs) | set(sequential_pairs(members, args.sequential_window)))
                 write_pairs(pair_path, pairs)
-            index['coalitions'][label] = {'members': members, 'pairs': str(pair_path)}
+            index['coalitions'][label] = {'members': members, 'pairs': artifact_ref(root, pair_path)}
             union.update(pairs)
         union_path = pair_root / 'union.txt'
         write_pairs(union_path, sorted(union))
-        index['union'] = str(union_path)
+        index['union'] = artifact_ref(root, union_path)
         save_json(root / f'bank_index-{args.experiment}.json', index)
 
 
@@ -101,12 +110,12 @@ def bank_preset(scene, args, preset):
     env = environment()
     local_key, matcher_key = PRESETS[preset]
     dense = local_key is None
-    union = read_pairs(Path(index['union']))
+    union = read_pairs(artifact_path(root, index['union']))
     conf, features = None, None
 
-    with scene_lock(root.parent / f'.bank-{preset}.lock'):
+    with scene_lock(root.parent / f'.bank-{local_key or preset}.lock'):
         if dense:
-            from coalition_dense import dense_config, ensure_dense_raw
+            from .dense import dense_config, ensure_dense_raw
             matcher_conf = dense_config(preset)
             code = hashlib.sha256((CODE_ROOT / 'hloc/matchers/mast3r.py').read_bytes()).hexdigest()
             match_id = config_id(env, {'dense': matcher_conf, 'matcher_code': code})
@@ -139,15 +148,16 @@ def bank_preset(scene, args, preset):
         for label, c in index['coalitions'].items():
             job = {'label': label, 'members': c['members'], 'pairs': c['pairs']}
             if dense:  # el ensamblado ocurre en la etapa SfM (CPU)
-                job['dense'] = {'raw': str(match_path),
-                                'folder': str(root / 'dense_assembled' / match_id),
+                job['dense'] = {'raw': artifact_ref(root, match_path),
+                                'folder': artifact_ref(root, root / 'dense_assembled' / match_id),
                                 'max_keypoints': args.max_keypoints,
                                 'cell_size': matcher_conf['cell_size']}
             else:
-                job.update(features=str(features), matches=str(match_path))
+                job.update(features=artifact_ref(root, features), matches=artifact_ref(root, match_path))
             jobs.append(job)
         save_json(root / 'jobs' / f'{args.experiment}.json', {
-            'scene': str(scene), 'preset': preset, 'experiment': args.experiment,
+            'scene': scene.name, 'preset': preset, 'experiment': args.experiment,
+            'format_version': 2, 'request': request_spec(args),
             'run_base': base, 'jobs': jobs,
             'config': {'preset': preset, 'experiment': args.experiment,
                        'global': index['global_conf'], 'local': conf, 'matcher': matcher_conf,
@@ -159,7 +169,7 @@ def bank_preset(scene, args, preset):
 def sfm_worker(job, threads):
     try:
         if 'dense' in job:
-            from coalition_dense import assemble_dense
+            from .dense import assemble_dense
             d = job['dense']
             features, matches = assemble_dense(
                 Path(d['raw']), read_pairs(Path(job['pairs'])), job['members'],
