@@ -144,3 +144,26 @@ python -m unittest discover -s tests -v
 The implementation lives in `lima3d/`, with file and path utilities in `utils/`.
 Tests cover caching, scheduling, imports, portability, and resume behavior;
 MVS subprocesses are simulated and do not validate full GPU densification.
+
+## Progress display
+
+Interactive terminals show one job counter per active stage and a live line for
+running workers. Counters distinguish `completed`, `cached`, `skipped`, and
+`failed`, with queued/running counts. Retrieval jobs shared by experiments count
+once. Totals grow as downstream jobs are discovered; resolved jobs include
+failures, so a finished counter does not imply every reconstruction succeeded.
+
+Worker lines show the GPU index or CPU worker PID, task name, elapsed time,
+current operation, and recent log output. SIFT, sparse matching, and MASt3R
+report image/pair counts; learned feature extraction also exposes its own log
+progress. SfM and MVS show the current operation without a speculative ETA.
+Updates to worker status files are throttled to avoid per-item disk writes.
+
+Fully reused jobs count as cached; jobs that compute any missing work count as
+completed. A new SfM attempt producing `no_model` counts as skipped; a previously
+cached `no_model` counts as cached. MVS without a valid model is skipped, while
+missing or incomplete required SfM output is reported as a failure.
+
+When output is redirected, animated bars are disabled; start/end messages and
+final counters remain available. Detailed worker logs are under `_logs/` and
+atomic current-status files are under `_tasks/` in the output root.

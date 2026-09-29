@@ -13,6 +13,7 @@ import traceback
 from pathlib import Path
 
 from .utils.paths import REPO_ROOT
+from .utils.progress import StageCounts, read_status
 
 try:
     from tqdm import tqdm
@@ -143,32 +144,41 @@ def orchestrate(cfg, stages):
     ready = {'gpu': [], 'cpu': []}
     running, busy, runs, failures = [], {}, {}, []
     stats = dict.fromkeys(ALL_STAGES, 0)
+    counts = {k: StageCounts() for k in ALL_STAGES}
     waiting_bank = {}
     expanded_runs = set()
     t0 = time.time()
 
     # ---- panel de progreso
-    ncoal = len(coalitions(first.platforms))
-    n_jobs = len(info) * len(exps)
-    totals = {'pairs': n_jobs, 'bank': n_jobs, 'sfm': n_jobs * ncoal,
-              'mvs': len(info) * sum(bool(e.mvs) for e in exps.values()) * ncoal}  # cota superior
-    active = [s for s in ALL_STAGES if s in stages]
+    active = [k for k in ALL_STAGES if k in stages]
     bars, live = {}, []
-    if tqdm:
+    interactive = tqdm is not None and sys.stderr.isatty()
+    if interactive:
         for i, k in enumerate(active):
-            bars[k] = tqdm(total=totals[k], desc=f'{k:5}', position=i, dynamic_ncols=True)
-        for j in range(len(gpu_free) + 1):  # una línea por GPU + una para SfM
-            live.append(tqdm(total=0, position=len(active) + j, bar_format='{desc}',
-                             dynamic_ncols=True))
+            bars[k] = tqdm(total=0, desc=k, position=i, dynamic_ncols=True,
+                           bar_format='{desc}: |{bar:12}| {n_fmt}/{total_fmt} jobs [{elapsed}] {postfix}')
+        for j in range(len(gpu_free) + len(cpu_free)):
+            live.append(tqdm(total=0, position=len(active) + j,
+                             bar_format='{desc}', dynamic_ncols=True))
+
+    def finish(kind, outcome):
+        counts[kind].finish(outcome)
+        stats[kind] = counts[kind].resolved
+
+    def worker_outcome(kind, name, ok):
+        if not ok:
+            return 'failed'
+        status = read_status(task_dir / f'{kind}-{name}.progress.json')
+        return 'cached' if status and not status.get('worked') else 'completed'
 
     def say(msg):
-        (tqdm.write if tqdm else print)(msg)
+        (tqdm.write if interactive else print)(msg)
 
     def tail(task):
         try:
             with (log_dir / f'{task.kind}-{task.name}.log').open('rb') as f:
                 f.seek(0, 2)
-                f.seek(max(0, f.tell() - 2000))
+                f.seek(max(getattr(task, "log_offset", 0), f.tell() - 2000))
                 text = f.read().decode(errors='ignore')
         except OSError:
             return ''
@@ -177,20 +187,30 @@ def orchestrate(cfg, stages):
 
     def refresh():
         for k, bar in bars.items():
-            bar.n = stats[k]
-            bar.set_postfix(fail=len(failures))
+            bar.total = counts[k].total
+            bar.n = counts[k].resolved
+            queued = sum(t.kind == k for q in ready.values() for t in q)
+            active_jobs = sum(t.kind == k for _, t, _ in running)
+            bar.set_postfix({**counts[k].counts, 'running': active_jobs, 'queued': queued}, refresh=False)
             bar.refresh()
-        if not live:
-            return
-        gpu_tasks = [t for _, t, _ in running if t.resource == 'gpu']
-        for i, line in enumerate(live[:-1]):
-            if i < len(gpu_tasks):
-                t = gpu_tasks[i]
-                line.set_description_str(f'GPU task: {t.kind} {t.name} | {tail(t)}')
-            else:
-                line.set_description_str('GPU idle')
-        n_sfm = sum(t.resource == 'cpu' for _, t, _ in running)
-        live[-1].set_description_str(f'SfM workers running: {n_sfm}')
+        for i, line in enumerate(live):
+            if i >= len(running):
+                line.set_description_str('Idle')
+                continue
+            proc, task, slot = running[i]
+            status = read_status(task.progress_path)
+            operation = status.get('operation', 'Starting')
+            current, total = status.get('current'), status.get('total')
+            if current is not None and total is not None:
+                operation += f" | {current}/{total} {status.get('unit') or ''}"
+            elapsed = int(time.monotonic() - task.started)
+            detail = tail(task)
+            if task.kind in ('pairs', 'bank') and '--experiment' in task.cmd:
+                exp = task.cmd[task.cmd.index('--experiment') + 1]
+                if exps[exp].device == 'cpu':
+                    task.location = 'CPU bank'
+            line.set_description_str(
+                f'{task.location} | {task.kind} {task.name} | {elapsed}s | {operation} | {detail}')
 
     def close_bars():
         refresh()
@@ -208,7 +228,7 @@ def orchestrate(cfg, stages):
 
     def fail(label, reason):
         failures.append(f'{label}: {reason}')
-        say(f'{stamp()} FALLO {label}: {reason}')
+        say(f'{stamp()} FAILED {label}: {reason}')
 
     def key_of(exp):  # sp-sg y sp-lg comparten .h5 local; los densos, el raw por preset
         preset = exps[exp].configs[0]
@@ -220,12 +240,20 @@ def orchestrate(cfg, stages):
         root = info[sname]['root']
         path = root / 'jobs' / f'{exp}.json'
         if not path.is_file():
+            kind = 'sfm' if 'sfm' in stages else 'mvs'
+            counts[kind].add()
+            finish(kind, 'failed')
             fail(f'{sname}/{exp}', f'falta {path}; corre build_bank_matching.py')
             return
         man = json.loads(path.read_text())
         check_bank_request(man, args)
         run_root = reconstruction_root(root, man)
         if str(run_root) in expanded_runs:
+            for kind in ('sfm', 'mvs'):
+                if kind in stages and (kind != 'mvs' or args.mvs):
+                    for _ in man['jobs']:
+                        counts[kind].add()
+                        finish(kind, 'skipped')
             say(f'[CACHE] Experimento equivalente: {exp} -> {run_root.name}')
             return
         expanded_runs.add(str(run_root))
@@ -244,12 +272,15 @@ def orchestrate(cfg, stages):
                 if res is not None:
                     queue_mvs(sname, exp, job, res)
                 elif args.mvs:
+                    counts['mvs'].add()
+                    finish('mvs', 'failed')
                     fail(f'mvs/{sname}/{exp}/{job["label"]}', 'SfM pendiente o incompleto; ejecuta build_sfm_sparser.py')
 
     def submit_sfm(sname, exp, job):
+        counts['sfm'].add()
         cached = cached_result(Path(job['run_root']) / job['label'])
         if cached is not None:
-            sfm_finished(sname, exp, job, cached)
+            sfm_finished(sname, exp, job, cached, cached=True)
             return
         tid = f'{sname}-{exp}-{job["label"]}'
         job['result_file'] = str(task_dir / f'sfm-{tid}.result.json')
@@ -270,8 +301,9 @@ def orchestrate(cfg, stages):
                                  cmd_for('sfm', sname, exp, path), done,
                                  group=(sname, key_of(exp)), mode='r'))
 
-    def sfm_finished(sname, exp, job, res):
-        stats['sfm'] += 1
+    def sfm_finished(sname, exp, job, res, cached=False):
+        outcome = 'failed' if res['status'] == 'error' else ('cached' if cached else ('skipped' if res['status'] == 'no_model' else 'completed'))
+        finish('sfm', outcome)
         run = runs.get(job['run_root'])
         if run is not None:
             run['summary'][job['label']] = res
@@ -280,11 +312,16 @@ def orchestrate(cfg, stages):
                 save_json(Path(job['run_root']) / 'summary.json', run['summary'])
         if res['status'] == 'error':
             fail(f'sfm/{sname}/{exp}/{job["label"]}', res.get('error', ''))
+            queue_mvs(sname, exp, job, res)
             return
         queue_mvs(sname, exp, job, res)
 
     def queue_mvs(sname, exp, job, res):
-        if 'mvs' not in stages or not exps[exp].mvs or res['status'] != 'complete':
+        if 'mvs' not in stages or not exps[exp].mvs:
+            return
+        counts['mvs'].add()
+        if res['status'] != 'complete':
+            finish('mvs', 'skipped')
             return
         model = Path(job['run_root']) / job['label'] / res['model_path']
         try:
@@ -296,7 +333,7 @@ def orchestrate(cfg, stages):
         save_json(path, {'model': str(model), 'images': job['scene']})
 
         def done(ok):
-            stats['mvs'] += ok
+            finish('mvs', worker_outcome('mvs', tid, ok))
             if not ok:
                 fail(f'mvs/{tid}', 'ver log')
 
@@ -309,17 +346,17 @@ def orchestrate(cfg, stages):
         if not ok:
             fail(f'pairs/{sname}/{exp}', 'ver log')
             if bank:
+                finish('bank', 'skipped')
                 failures.append(f'bank/{sname}/{exp}: omitido (fallaron los pares)')
             return
-        stats['pairs'] += 1
         if bank:
             ready['gpu'].append(bank)
 
     def on_bank(sname, exp, ok):
+        finish('bank', worker_outcome('bank', f'{sname}-{exp}', ok))
         if not ok:
             fail(f'bank/{sname}/{exp}', 'ver log')
             return
-        stats['bank'] += 1
         if 'sfm' in stages:
             expand(sname, exp)
 
@@ -328,6 +365,8 @@ def orchestrate(cfg, stages):
     for sname, meta in info.items():
         for exp, args in exps.items():
             preset = args.configs[0]
+            if 'bank' in stages:
+                counts['bank'].add()
             bank = Task('bank', f'{sname}-{exp}', 'gpu', (1, -meta['n'] * HEAVY[preset]),
                         cmd_for('bank', sname, exp),
                         (lambda ok, s=sname, e=exp: on_bank(s, e, ok)),
@@ -344,7 +383,9 @@ def orchestrate(cfg, stages):
 
     for (sname, _, _, _), members in pair_groups.items():
         leader = members[0]
+        counts['pairs'].add()
         def pairs_done(ok, sname=sname, members=members, leader=leader):
+            finish('pairs', worker_outcome('pairs', f'{sname}-{leader}', ok))
             if ok:
                 root = info[sname]['root']
                 index = json.loads((root / f'bank_index-{leader}.json').read_text())
@@ -382,14 +423,23 @@ def orchestrate(cfg, stages):
             visible = os.environ.get('CUDA_VISIBLE_DEVICES')
             ids = visible.split(',') if visible is not None else None
             env['CUDA_VISIBLE_DEVICES'] = ids[gpu] if ids is not None else str(gpu)
+        task.progress_path = task_dir / f'{task.kind}-{task.name}.progress.json'
+        save_json(task.progress_path, {'operation': 'Starting', 'worked': False})
+        env['LIMA3D_PROGRESS_FILE'] = str(task.progress_path.resolve())
+        env['PYTHONUNBUFFERED'] = '1'
+        task.started = time.monotonic()
+        task.location = f'GPU {env.get("CUDA_VISIBLE_DEVICES", gpu)}' if gpu is not None else f'CPU cores {cores}'
         pin = (lambda: os.sched_setaffinity(0, cores)) if cores else None
         with (log_dir / f'{task.kind}-{task.name}.log').open('a') as log:
+            task.log_offset = log.tell()
             proc = subprocess.Popen(task.cmd, env=env, stdout=log,
                                     stderr=subprocess.STDOUT, preexec_fn=pin, start_new_session=True)
+        if gpu is None:
+            task.location = f'CPU worker {proc.pid} | cores {cores}'
         if task.group:
             busy[task.group] = -1 if task.mode == 'w' else busy.get(task.group, 0) + 1
         running.append((proc, task, slot))
-        where = f' GPU {gpu}' if gpu is not None else ''
+        where = f' {task.location}'
         say(f'{stamp()} START {task.kind} {task.name}{where}')
 
     def release(task):
@@ -424,7 +474,7 @@ def orchestrate(cfg, stages):
                 (gpu_free if task.resource == 'gpu' else cpu_free).append(slot)
                 release(task)
                 if task.kind != 'sfm' or code != 0:
-                    say(f'{stamp()} END   {task.kind} {task.name} (código {code})')
+                    say(f'{stamp()} END   {task.kind} {task.name} (exit {code})')
                 task.done(code == 0)
                 if task.kind == 'sfm':
                     say(f'{stamp()} sfm hechos: {stats["sfm"]}  mvs hechos: {stats["mvs"]}')
@@ -451,8 +501,11 @@ def orchestrate(cfg, stages):
         raise
 
     close_bars()
-    print(f'\nPares {stats["pairs"]} | bancos {stats["bank"]} | SfM {stats["sfm"]} | '
-          f'MVS {stats["mvs"]} | tiempo {stamp()}', flush=True)
+    for kind in active:
+        c = counts[kind]
+        print(f'{kind}: {c.resolved}/{c.total} resolved | ' +
+              ' | '.join(f'{key}={value}' for key, value in c.counts.items()), flush=True)
+    print(f'Elapsed: {stamp()}', flush=True)
     if failures:
         print('Fallos:\n  ' + '\n  '.join(failures), flush=True)
     return len(failures)

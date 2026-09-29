@@ -1,4 +1,6 @@
 """Adaptador MASt3R: inferencias por par compartidas, tracks aislados por coalición."""
+from .utils.progress import report as emit_progress
+
 from collections import defaultdict
 from pathlib import Path
 
@@ -39,6 +41,7 @@ def ensure_dense_raw(conf, scene, pairs, path, device):
     if not pending:
         print(f'  [CACHE] MASt3R raw: {len(pairs)} pares', flush=True)
         return
+    emit_progress('MASt3R inference', 0, len(pending), 'pairs', work=True)
     print(f'  MASt3R {conf["model"]["weights"]}: {len(pending)} pares nuevos', flush=True)
     model = dynamic_load(matchers, 'mast3r')(conf['model']).eval().to(device)
     dataset = ImagePairDataset(scene, conf['preprocessing'], pending)
@@ -61,6 +64,7 @@ def ensure_dense_raw(conf, scene, pairs, path, device):
             del pred, image0, image1
             if (index + 1) % 10 == 0 or index + 1 == len(dataset):
                 print(f'  MASt3R {index + 1}/{len(dataset)}', flush=True)
+            emit_progress('MASt3R inference', index + 1, len(dataset), 'pairs', work=True)
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -107,6 +111,7 @@ def _assemble_dense(raw_path, pairs, names, folder, max_keypoints, cell_size=1.0
         if valid:
             print(f'  [CACHE] MASt3R ensamblado: {identifier}', flush=True)
             return features, matches
+    emit_progress('Dense track assembly', work=True)
     adjacency = defaultdict(list)
     for a, b in pairs:
         adjacency[a].append((names_to_pair(a, b), 'keypoints0'))

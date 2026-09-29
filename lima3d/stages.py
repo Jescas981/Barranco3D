@@ -1,4 +1,6 @@
 """Tareas atómicas: pares, banco por experimento y worker de SfM."""
+from .utils.progress import report as emit_progress
+
 import hashlib
 import importlib.util
 import json
@@ -74,6 +76,7 @@ def stage_pairs(scene, args):
         for combo in coalitions(args.platforms):
             members = sorted(n for p in combo for n in images[p])
             label = '+'.join(combo)
+            emit_progress(f'Retrieval: {label}')
             pair_path = pair_root / f'{label}.txt'
             if pair_path.exists():
                 pairs = read_pairs(pair_path)
@@ -87,8 +90,10 @@ def stage_pairs(scene, args):
                     if any(len(p) != 2 or not set(p) <= set(members) for p in pairs):
                         raise ValueError(f'Retrieval inválido: {retrieval_path}')
                 else:
+                    emit_progress(f'Retrieval: {label}', work=True)
                     pairs = retrieval_pairs(gpath, members, args.top_k, args.query_batch, args.database_batch)
                     write_pairs(retrieval_path, pairs)
+                emit_progress(f'Pair selection: {label}', work=True)
                 pairs = sorted(set(pairs) | set(sequential_pairs(members, args.sequential_window)))
                 write_pairs(pair_path, pairs)
             index['coalitions'][label] = {'members': members, 'pairs': artifact_ref(root, pair_path)}

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Features y SfM para todas las coaliciones de plataformas, con cachés compartidas."""
+from .utils.progress import report as emit_progress
+
 import argparse
 from copy import deepcopy
 import hashlib
@@ -113,6 +115,7 @@ def extract_sift(conf, scene, names, path, device='cpu', threads=1):
             group.create_dataset('image_size', data=data['original_size'])
         if (index + 1) % 100 == 0 or index + 1 == len(dataset):
             print(f'  SIFT {index + 1}/{len(dataset)}', flush=True)
+        emit_progress('SIFT extraction', index + 1, len(dataset), 'images', work=True)
 
 
 def ensure_features(conf, scene, names, path, global_features=False, device='cpu', threads=1):
@@ -139,6 +142,7 @@ def ensure_features(conf, scene, names, path, global_features=False, device='cpu
                     del features[name]
                 missing.append(name)
     if missing:
+        emit_progress('Global features' if global_features else 'Local features', unit='images', work=True)
         print(f'  Features: {len(missing)} pendientes / {len(names)}', flush=True)
         if conf['model']['name'] == 'dog' and conf['model'].get('descriptor') == 'sift':
             extract_sift(conf, scene, missing, path, device=device, threads=threads)
@@ -246,6 +250,7 @@ def ensure_matches(conf, pairs, features_path, matches_path, device):
     if not missing:
         print(f'  [CACHE] matches: {len(pairs)} pares', flush=True)
         return
+    emit_progress('Matching', 0, len(missing), 'pairs', work=True)
     print(f'  Matching: {len(missing)} nuevos / {len(pairs)} pares', flush=True)
     model = None
     dataset = match_features.FeaturePairsDataset(missing, features_path, features_path)
@@ -267,6 +272,7 @@ def ensure_matches(conf, pairs, features_path, matches_path, device):
                 del pred
             if (index + 1) % 100 == 0 or index + 1 == len(missing):
                 print(f'  Matches {index + 1}/{len(missing)}', flush=True)
+            emit_progress('Matching', index + 1, len(missing), 'pairs', work=True)
             del data
     del model
     if torch.cuda.is_available():
@@ -294,6 +300,7 @@ def _reconstruct(scene, names, pairs_path, features, matches, folder, threads, s
             return result
     folder.mkdir(parents=True, exist_ok=True)
     # No borrar un modelo previo o restos de un intento fallido.
+    emit_progress('Geometric verification / SfM', work=True)
     attempt = folder / f'attempt_{time.time_ns()}'
     result = {'status': 'running', 'input_images': len(names), 'model_path': attempt.name}
     save_json(report, result)

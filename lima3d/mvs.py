@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """MVS de COLMAP reanudable, sobre SfM existentes de cualquier matcher."""
+from .utils.progress import report as emit_progress
+
 import argparse
 import hashlib
 import json
@@ -204,6 +206,7 @@ def run_mvs(model, images, output=None, *, colmap='colmap', max_image_size=1024,
                 for later, _ in steps[steps.index((step, command)) + 1:]:
                     state['steps'].pop(later, None)
                 save_json(state_path, state)
+                emit_progress(f'MVS: {step}', work=True)
                 print(f'  [RUN] MVS {step}', flush=True)
                 with (output / f'{step}.log').open('a') as log:
                     subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT,
