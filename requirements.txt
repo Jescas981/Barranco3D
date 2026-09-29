@@ -7,6 +7,7 @@ h5py
 pillow
 torch
 pycolmap
+pycolmap-cuda
 torchvision
 scipy
 matplotlib

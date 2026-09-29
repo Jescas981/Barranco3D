@@ -5,3 +5,5 @@
 /frames/
 .vscode/
 .venv/
+/dataset
+/outputs/
