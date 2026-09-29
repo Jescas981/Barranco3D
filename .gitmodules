@@ -1,3 +1,6 @@
 [submodule "third_party/SuperGluePretrainedNetwork"]
 	path = third_party/SuperGluePretrainedNetwork
 	url = https://github.com/magicleap/SuperGluePretrainedNetwork.git
+[submodule "third_party/aerial-megadepth"]
+	path = third_party/aerial-megadepth
+	url = https://github.com/kvuong2711/aerial-megadepth

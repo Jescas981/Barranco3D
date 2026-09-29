@@ -36,6 +36,20 @@ from .utils.parsers import names_to_pair, parse_retrieval
 #      images, export_dir=outputs, features_ref=features, max_kps=None)
 
 confs = {
+    "mast3r": {
+        "output": "matches-mast3r",
+        "model": {"name": "mast3r", "weights": "mast3r"},
+        "preprocessing": {"grayscale": False, "resize_max": 512, "dfactor": 16},
+        "max_error": 1,
+        "cell_size": 1, 
+    },
+    "mast3r-aerialmd": {
+        "output": "matches-mast3r-aerialmd",
+        "model": {"name": "mast3r", "weights": "aerialmd"},
+        "preprocessing": {"grayscale": False, "resize_max": 512, "dfactor": 16},
+        "max_error": 1,
+        "cell_size": 1, 
+    },
     # Best quality but loads of points. Only use for small scenes
     "loftr": {
         "output": "matches-loftr",
@@ -590,10 +604,8 @@ if __name__ == "__main__":
     parser.add_argument("--pairs", type=Path, required=True)
     parser.add_argument("--image_dir", type=Path, required=True)
     parser.add_argument("--export_dir", type=Path, required=True)
-    parser.add_argument("--matches", type=Path, default=confs["loftr"]["output"])
-    parser.add_argument(
-        "--features", type=str, default="feats_" + confs["loftr"]["output"]
-    )
+    parser.add_argument("--matches", type=Path, default=None)
+    parser.add_argument("--features", type=str, default=None)
     parser.add_argument("--conf", type=str, default="loftr", choices=list(confs.keys()))
     args = parser.parse_args()
     main(
