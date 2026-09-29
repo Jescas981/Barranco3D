@@ -1,0 +1,43 @@
+data:
+  frames_root: frames
+  output_root: outputs/coalitions
+  scenes: null                  # null = todas las carpetas bajo frames_root
+  platforms: [Car, Drone, Pedestrian]
+  device: auto                  # auto | cpu | cuda
+
+resources:
+  bank:                         # pares + banco (GPU)
+    gpus: 1                     # número, o lista de ids: [0, 1]
+    threads: 4                  # núcleos CPU por tarea
+  sfm:                          # SfM (solo CPU)
+    workers: 0                  # coaliciones en paralelo; 0 = automático
+    threads: 6                  # threads por coalición
+  mvs:                          # MVS (GPU)
+    gpus: 4                     # número, o lista de ids: [0, 1, 2, 3]
+    threads: 4                  # núcleos CPU por tarea
+
+mvs:
+  enabled: true
+  colmap: colmap
+  max_image_size: 1024
+  cache_gb: 2.0
+  num_sources: 10
+
+defaults:
+  global_feature: netvlad
+  top_k: 20
+  sequential_window: 0
+  max_keypoints: 4096
+  resize_max: 1024
+  camera_mode: PER_FOLDER
+  seed: 0
+
+experiments:
+  - {name: sift,   preset: sift}
+  - {name: sp-sg,  preset: sp-sg}
+  - {name: mast3r, preset: mast3r}
+  - name: sp-sg-k40-seq5
+    preset: sp-sg
+    top_k: 40
+    sequential_window: 5
+    mvs: false

@@ -471,7 +471,7 @@ def run_scene(scene, args):
         print(f'Resultados/caché: {root}', flush=True)
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--frames-root', type=Path, default=Path('frames'))
     parser.add_argument('--scenes', nargs='+', help='Por defecto: todas las escenas bajo frames/')
@@ -494,7 +494,11 @@ def main():
     parser.add_argument('--camera-mode', choices=['PER_FOLDER', 'PER_IMAGE'], default='PER_FOLDER')
     parser.add_argument('--until', choices=['features', 'pairs', 'matches', 'sfm'], default='sfm')
     parser.add_argument('--dry-run', action='store_true')
-    args = parser.parse_args()
+    return parser
+
+
+def validate(args, parser):
+    """Valida argumentos y devuelve la lista de escenas."""
     args.requested_device = args.device
     for name in ('top_k', 'query_batch', 'database_batch', 'resize_max', 'max_keypoints', 'threads'):
         if getattr(args, name) < 1:
@@ -511,29 +515,41 @@ def main():
         parser.error(f'No existe {root}')
     if args.scenes and any(Path(s).name != s or s in ('.', '..') for s in args.scenes):
         parser.error('scenes debe contener nombres de carpetas')
-    scenes = [root / s for s in args.scenes] if args.scenes else sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith('.'))
+    scenes = [root / s for s in args.scenes] if args.scenes else sorted(
+        p for p in root.iterdir() if p.is_dir() and not p.name.startswith('.'))
     if not scenes:
         parser.error('No se encontraron escenas')
+    return scenes
+
+
+def setup_runtime(args):
+    """Limita hilos/núcleos, resuelve el dispositivo y fija semillas."""
+    for variable in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
+        os.environ[variable] = str(args.threads)
+    if hasattr(os, 'sched_getaffinity'):
+        available = sorted(os.sched_getaffinity(0))
+        os.sched_setaffinity(0, available[:args.threads])
+    if args.device == 'cpu':
+        os.environ['CUDA_VISIBLE_DEVICES'] = ''
+    import torch
+    import cv2
+    import numpy as np
+    torch.set_num_threads(args.threads)
+    cv2.setNumThreads(args.threads)
+    if args.device == 'cuda' and not torch.cuda.is_available():
+        raise SystemExit('CUDA no disponible')
+    args.device = 'cuda' if args.device != 'cpu' and torch.cuda.is_available() else 'cpu'
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    scenes = validate(args, parser)
     if not args.dry_run:
-        # Limitar también bibliotecas nativas y procesos hijos; no modifica el sistema.
-        for variable in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):
-            os.environ[variable] = str(args.threads)
-        if hasattr(os, 'sched_getaffinity'):
-            available = sorted(os.sched_getaffinity(0))
-            os.sched_setaffinity(0, available[:args.threads])
-        if args.device == 'cpu':
-            os.environ['CUDA_VISIBLE_DEVICES'] = ''
-        import torch
-        import cv2
-        import numpy as np
-        torch.set_num_threads(args.threads)
-        cv2.setNumThreads(args.threads)
-        if args.device == 'cuda' and not torch.cuda.is_available():
-            parser.error('CUDA no disponible')
-        args.device = 'cuda' if args.device != 'cpu' and torch.cuda.is_available() else 'cpu'
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
+        setup_runtime(args)
     for scene in scenes:
         run_scene(scene, args)
 
