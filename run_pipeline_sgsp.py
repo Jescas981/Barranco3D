@@ -1,7 +1,10 @@
+import os
 import shutil
 import traceback
 from itertools import combinations
 from pathlib import Path
+
+import h5py
 
 from hloc import (
     extract_features,
@@ -24,6 +27,99 @@ NUM_RETRIEVALS = 50
 
 GLOBAL_FEATURE = "global-feats-netvlad"
 LOCAL_FEATURE = "feats-superpoint-n4096-r1024"
+
+
+# ============================================================
+# H5 / OUTPUT COMPLETENESS CHECKS
+# ============================================================
+# A file that merely *exists* may still be a partial/corrupt leftover
+# from a run that was interrupted (Ctrl-C, crash, OOM, etc). These
+# helpers check that the expected number of entries actually made it
+# in before treating a step as "already done" — so completed stages
+# are validated and skipped (not recomputed), while genuinely broken
+# ones get regenerated.
+#
+# NOTE: images/ is made of symlinked platform directories. Counting
+# must use os.walk(..., followlinks=True) — pathlib's rglob does NOT
+# reliably follow directory symlinks on newer Python versions, which
+# previously caused this check to see 0 images and wrongly delete
+# perfectly good feature files.
+
+IMG_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
+
+
+def _count_images(images_dir):
+    count = 0
+    for _root, _dirs, files in os.walk(images_dir, followlinks=True):
+        for name in files:
+            if Path(name).suffix.lower() in IMG_EXTENSIONS:
+                count += 1
+    return count
+
+
+def _count_pairs(pairs_path):
+    with open(pairs_path) as f:
+        return sum(1 for line in f if line.strip())
+
+
+def _h5_leaf_count(h5_path, leaf_name):
+    """Counts datasets named `leaf_name` anywhere in the h5 file
+    (features/matches are stored in nested groups keyed by image path,
+    e.g. 'Drone/DJI_0001.png/keypoints')."""
+    count = 0
+
+    def _visit(name, obj):
+        nonlocal count
+        if isinstance(obj, h5py.Dataset) and name.rsplit("/", 1)[-1] == leaf_name:
+            count += 1
+
+    try:
+        with h5py.File(h5_path, "r") as f:
+            f.visititems(_visit)
+    except Exception:
+        return 0
+
+    return count
+
+
+def _features_file_is_complete(h5_path, images_dir, leaf_name):
+    if not h5_path.exists():
+        return False
+    expected = _count_images(images_dir)
+    actual = _h5_leaf_count(h5_path, leaf_name)
+    return expected > 0 and actual >= expected
+
+
+def _matches_file_is_complete(matches_path, pairs_path):
+    if not matches_path.exists() or not pairs_path.exists():
+        return False
+    expected = _count_pairs(pairs_path)
+    actual = _h5_leaf_count(matches_path, "matches0")
+    return expected > 0 and actual >= expected
+
+
+def _get_image_names_from_features(h5_path):
+    """Returns the exact image names (relative paths) stored as keys in
+    the features h5 file.
+
+    hloc's Python-side extraction walks into symlinked platform
+    directories fine (via os.walk(followlinks=True) internally), but
+    COLMAP's own C++ image importer (used inside reconstruction.main())
+    does NOT follow directory symlinks, so it finds zero images when
+    p["images"] is made entirely of symlinked platform folders. Passing
+    this list explicitly via `image_list` bypasses COLMAP's own
+    directory scan and sidesteps the mismatch.
+    """
+    names = []
+
+    def _visit(name, obj):
+        if isinstance(obj, h5py.Dataset) and name.rsplit("/", 1)[-1] == "keypoints":
+            names.append(name.rsplit("/", 1)[0])
+
+    with h5py.File(h5_path, "r") as f:
+        f.visititems(_visit)
+
+    return sorted(names)
 
 
 # ============================================================
@@ -113,8 +209,15 @@ def extract_global_features(experiments):
         print(f"\n[{p['name']}]")
 
         if output.exists():
-            print("  [SKIP] NetVLAD already exists")
-            continue
+            if _features_file_is_complete(output, p["images"], "global_descriptor"):
+                print("  [SKIP] NetVLAD already exists")
+                continue
+            else:
+                print(
+                    "  [CLEANUP] Removing incomplete NetVLAD features "
+                    "(likely from an interrupted run)"
+                )
+                output.unlink()
 
         print("  [RUN] Extracting NetVLAD...")
 
@@ -221,10 +324,17 @@ def extract_local_features(experiments):
         print(f"\n[{p['name']}]")
 
         if output.exists():
-            print(
-                "  [SKIP] SuperPoint already exists"
-            )
-            continue
+            if _features_file_is_complete(output, p["images"], "keypoints"):
+                print(
+                    "  [SKIP] SuperPoint already exists"
+                )
+                continue
+            else:
+                print(
+                    "  [CLEANUP] Removing incomplete SuperPoint features "
+                    "(likely from an interrupted run)"
+                )
+                output.unlink()
 
         print(
             "  [RUN] Extracting SuperPoint..."
@@ -294,10 +404,17 @@ def match_features_for_experiments(experiments):
             continue
 
         if matches.exists():
-            print(
-                "  [SKIP] SuperGlue matches already exist"
-            )
-            continue
+            if _matches_file_is_complete(matches, pairs):
+                print(
+                    "  [SKIP] SuperGlue matches already exist"
+                )
+                continue
+            else:
+                print(
+                    "  [CLEANUP] Removing incomplete SuperGlue matches "
+                    "(likely from an interrupted run)"
+                )
+                matches.unlink()
 
         print(
             "  [RUN] Matching with SuperGlue..."
@@ -434,6 +551,14 @@ def run_sfm_reconstruction(experiments):
             "  [RUN] Running COLMAP SfM..."
         )
 
+        # p["images"] is made entirely of symlinked platform directories.
+        # COLMAP's own C++ image importer does not follow directory
+        # symlinks, so left to its own devices it registers zero images
+        # (the "0it" / KeyError failures seen earlier). Passing the
+        # exact image names explicitly bypasses COLMAP's directory scan
+        # entirely and sidesteps that mismatch.
+        image_names = _get_image_names_from_features(features)
+
         try:
             model = reconstruction.main(
                 sfm_dir,
@@ -441,6 +566,7 @@ def run_sfm_reconstruction(experiments):
                 pairs,
                 features,
                 matches,
+                image_list=image_names,
                 verbose=True,
             )
         except Exception:

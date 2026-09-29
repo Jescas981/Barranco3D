@@ -9,3 +9,6 @@ torch
 pycolmap
 torchvision
 scipy
+matplotlib
+einops
+safetensors
