@@ -9,6 +9,7 @@ from copy import deepcopy
 from pathlib import Path
 
 from .utils.paths import REPO_ROOT
+from .regions import prepared_scene, filter_features, filter_dense, effective_regions
 
 from .pipeline import (PRESETS, cache_environment, coalitions,
     ensure_features, ensure_matches, inventory, reconstruct, retrieval_pairs,
@@ -59,6 +60,7 @@ def stage_pairs(scene, args):
     """Globales + pares por coalición de UN experimento."""
     from hloc import extract_features
     images, snapshot, names, root = context(scene, args)
+    scene = prepared_scene(scene, args, root, names)
     env = environment()
     with scene_lock(root.parent / '.pairs.lock'):
         root.mkdir(parents=True, exist_ok=True)
@@ -108,6 +110,10 @@ def bank_preset(scene, args, preset):
     """Locales + matches de UN experimento; escribe jobs/<experimento>.json."""
     from hloc import extract_features, match_features
     _, _, names, root = context(scene, args)
+    original_scene = scene
+    scene = prepared_scene(scene, args, root, names)
+    regions = effective_regions(original_scene, getattr(args, 'regions', {}), args.platforms)
+    masked = any(r['mode'] == 'mask' for r in regions.values())
     index_path = root / f'bank_index-{args.experiment}.json'
     if not index_path.is_file():
         raise RuntimeError(f'Falta {index_path}; corre primero la fase de pares')
@@ -127,6 +133,9 @@ def bank_preset(scene, args, preset):
             match_path = root / 'dense_raw' / f'{match_id}.h5'
             save_json(match_path.with_suffix('.json'), matcher_conf)
             ensure_dense_raw(matcher_conf, scene, union, match_path, args.device)
+            if masked:
+                match_path = filter_dense(match_path, match_path.with_name(match_id + '-masked.h5'),
+                                          original_scene, union, regions)
         else:
             conf = deepcopy(extract_features.confs[local_key])
             conf['preprocessing']['resize_max'] = args.resize_max
@@ -140,6 +149,9 @@ def bank_preset(scene, args, preset):
             save_json(features.with_suffix('.json'), conf)
             ensure_features(conf, scene, names, features,
                             device=args.sift_device or args.requested_device, threads=args.threads)
+            if masked:
+                features = filter_features(features, features.with_name(local_id + '-masked.h5'),
+                                           original_scene, names, regions)
             matcher_conf = deepcopy(match_features.confs[matcher_key])
             match_id = digest({'local': local_id, 'matcher': config_id(env, matcher_conf)})
             match_path = root / 'matches' / f'{match_id}.h5'
@@ -161,7 +173,7 @@ def bank_preset(scene, args, preset):
                 job.update(features=artifact_ref(root, features), matches=artifact_ref(root, match_path))
             jobs.append(job)
         save_json(root / 'jobs' / f'{args.experiment}.json', {
-            'scene': scene.name, 'preset': preset, 'experiment': args.experiment,
+            'scene': original_scene.name, 'preset': preset, 'experiment': args.experiment,
             'format_version': 2, 'request': request_spec(args),
             'run_base': base, 'jobs': jobs,
             'config': {'preset': preset, 'experiment': args.experiment,

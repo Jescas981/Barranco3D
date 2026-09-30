@@ -64,7 +64,7 @@ def plan_scene(scene, groups, fps):
     return plan
 
 
-def write_instructions(output):
+def write_instructions(output, has_masks=False):
     # Rutas relativas al script para que el proyecto pueda moverse.
     commands = '''#!/bin/sh
 set -eu
@@ -73,37 +73,34 @@ colmap feature_extractor --database_path database.db --image_path .. --ImageRead
 colmap exhaustive_matcher --database_path database.db
 colmap mapper --database_path database.db --image_path .. --output_path sparse
 '''
+    if has_masks:
+        commands = commands.replace('--ImageReader.single_camera_per_folder 1',
+                                    '--ImageReader.single_camera_per_folder 1 --ImageReader.mask_path masks')
     (output / 'run_colmap.sh').write_text(commands)
-    (output / 'README.md').write_text('''# Proyecto COLMAP
+    (output / 'README.md').write_text("""# COLMAP project
 
-Imágenes en la carpeta superior, organizadas por plataforma y cámara; `sparse/` queda
-preparado para la reconstrucción. COLMAP creará `database.db` al extraer
-características. Ejecuta `sh run_colmap.sh` cuando quieras reconstruir.
-El script de extracción no ejecuta COLMAP.
+Images are in the parent folder, grouped by platform and camera.
+Run `sh run_colmap.sh` to reconstruct; extraction does not run COLMAP.
+The script creates a database and writes sparse models under `sparse/`.
 
-Se comparten intrínsecos por carpeta: Car/cam0, Car/cam1, Drone, etc.
-Esto supone la misma lente y zoom entre videos de una carpeta. Si cambian,
-separa los videos en subcarpetas antes de extraer. Las resoluciones deben
-coincidir dentro de cada carpeta.
-No se configura un rig sincronizado: los recortes no necesariamente coinciden
-en tiempo y no se dispone de extrínsecos calibrados.
+Intrinsics are shared per folder. Keep lens, zoom, and resolution consistent
+within each folder. No synchronized camera rig is assumed.
 
-`extraction.json` registra videos, FPS, cantidades y metadatos de recortes
-cuando están disponibles. `image_list.txt` contiene rutas relativas a la carpeta de la escena en frames/.
-Los nombres contienen el video de origen y un índice de muestra desde cero;
-ese índice no es el índice del frame original. FFmpeg usa timestamps para
-muestrear a FPS constantes; con video variable puede repetir una imagen para
-cubrir un hueco temporal. Cada clip empieza su propia rejilla temporal en cero.
-Los metadatos de recortes se conservan como procedencia, no como sincronización.
+`extraction.json` records source videos, FPS, frame counts, and available clip
+metadata. `image_list.txt` contains paths relative to the scene's image root.
+Names include the source video and a zero-based sample index, not the original
+frame index. Each clip is sampled independently using timestamps; variable-rate
+video can produce repeated images. Clip metadata does not imply synchronization.
 
-Se preservan las dimensiones codificadas, sin auto-rotación ni redimensionado.
-JPEG usa calidad alta; PNG evita pérdida adicional. El matcher exhaustivo
-compara todos los pares y puede ser costoso con muchos miles de imágenes.
-''')
+Encoded dimensions are preserved without automatic rotation or resizing.
+JPEG uses high quality; PNG avoids additional compression loss.
+Exhaustive matching can be expensive for large image collections.
+""")
 
 
-def extract_scene(scene, output, fps, groups=None, image_format='jpg', threads=1, dry_run=False):
+def extract_scene(scene, output, fps, groups=None, image_format='jpg', threads=1, dry_run=False, regions=None):
     scene, output = Path(scene).resolve(), Path(output).resolve()
+    regions = regions or {}
     if not math.isfinite(fps) or fps <= 0:
         raise ValueError('FPS debe ser finito y mayor que cero')
     if threads < 1:
@@ -120,6 +117,21 @@ def extract_scene(scene, output, fps, groups=None, image_format='jpg', threads=1
         if not shutil.which(executable):
             raise ValueError(f'Falta instalar {executable}')
     plan = plan_scene(scene, groups, fps)
+    for entry in plan:
+        platform = Path(entry['relative_video']).parts[0]
+        from lima3d.regions import region_for_name
+        region = region_for_name(regions, entry['relative_video'])
+        entry['region'] = region
+        if region['mode'] == 'crop':
+            left, top, right, bottom = region['box']
+            if not (0 <= left < right <= entry['width'] and 0 <= top < bottom <= entry['height']):
+                raise ValueError(f'Crop exceeds video dimensions: {entry["relative_video"]}')
+            entry['output_width'], entry['output_height'] = right-left, bottom-top
+        elif region['mode'] == 'mask' and 'path' in region:
+            from PIL import Image
+            with Image.open(region['path']) as mask:
+                if mask.size != (entry['width'], entry['height']):
+                    raise ValueError(f'Mask dimensions differ from video: {entry["relative_video"]}')
     if any(Path(p['image_folder']).parts and Path(p['image_folder']).parts[0] == '_colmap' for p in plan):
         raise ValueError('El nombre _colmap está reservado para metadatos de salida')
     print(f'Escena: {scene.name} | videos: {len(plan)} | FPS: {fps:g}')
@@ -133,7 +145,9 @@ def extract_scene(scene, output, fps, groups=None, image_format='jpg', threads=1
     project.mkdir()
     (project / 'sparse').mkdir()
     metadata = {'scene': str(scene), 'requested_fps': fps, 'format': image_format,
-                'status': 'in_progress', 'videos': plan}
+                'status': 'in_progress', 'videos': plan, 'source_regions': regions,
+                'applied_regions': {entry['image_folder']: entry['region'] for entry in plan
+                                    if entry['region']['mode'] == 'crop'}}
     manifest = project / 'extraction.json'
     manifest.write_text(json.dumps(metadata, indent=2) + '\n')
     try:
@@ -143,10 +157,14 @@ def extract_scene(scene, output, fps, groups=None, image_format='jpg', threads=1
                 folder.mkdir(parents=True, exist_ok=True)
                 # image2 interpreta % como patrón; escapar los % del nombre/ruta.
                 pattern = str(folder / entry['prefix']).replace('%', '%%') + f'__%06d.{image_format}'
+                filters = f'fps=fps={fps:.12g}:start_time=0:round=near'
+                if entry['region']['mode'] == 'crop':
+                    left, top, right, bottom = entry['region']['box']
+                    filters += f',crop=w={right-left}:h={bottom-top}:x={left}:y={top}:exact=1'
                 command = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-n',
                            '-threads', str(threads), '-noautorotate', '-i', entry['video'],
                            '-map', '0:v:0', '-an', '-sn', '-dn', '-filter_threads', str(threads),
-                           '-vf', f'fps=fps={fps:.12g}:start_time=0:round=near',
+                           '-vf', filters,
                            '-threads', str(threads), '-start_number', '0']
                 command += ['-q:v', '2'] if image_format == 'jpg' else ['-compression_level', '1']
                 command += [pattern]
@@ -157,10 +175,21 @@ def extract_scene(scene, output, fps, groups=None, image_format='jpg', threads=1
                 if not images:
                     raise RuntimeError(f'No se extrajeron imágenes de {entry["relative_video"]}')
                 for image in images:
-                    listing.write(image.relative_to(output).as_posix() + '\n')
+                    relative = image.relative_to(output).as_posix()
+                    listing.write(relative + '\n')
+                    if entry['region']['mode'] == 'mask':
+                        from PIL import Image
+                        from lima3d.regions import mask_path
+                        source = mask_path(regions, scene, relative)
+                        with Image.open(source) as mask:
+                            if mask.size != (entry['width'], entry['height']):
+                                raise ValueError(f'Mask dimensions differ from image: {relative}')
+                            target = project / 'masks' / (relative + '.png')
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            mask.convert('L').save(target)
                 entry['extracted_frames'] = len(images)
                 manifest.write_text(json.dumps(metadata, indent=2) + '\n')
-        write_instructions(project)
+        write_instructions(project, has_masks=(project / 'masks').is_dir())
         metadata['status'] = 'complete'
         metadata['total_frames'] = sum(p['extracted_frames'] for p in plan)
         print(f'Listo: {metadata["total_frames"]} imágenes en {output}')
@@ -173,24 +202,24 @@ def extract_scene(scene, output, fps, groups=None, image_format='jpg', threads=1
     return plan
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('scene', type=Path, help='Nombre de escena (DavidHouse) o ruta (datasets/DavidHouse)')
-    parser.add_argument('--fps', type=float, required=True, help='Imágenes por segundo; admite 0.5, 2, etc.')
-    parser.add_argument('--output', type=Path, help='Por defecto: frames/<escena>')
-    parser.add_argument('--groups', nargs='+', help='Solo estas carpetas: Car Drone Pedestrian')
-    parser.add_argument('--format', choices=['jpg', 'png'], default='jpg')
-    parser.add_argument('--threads', type=int, default=1)
-    parser.add_argument('--dry-run', action='store_true')
-    args = parser.parse_args()
-    scene = args.scene
-    if len(scene.parts) == 1 and not scene.is_dir():
-        scene = Path('datasets') / args.scene
-        if not scene.is_dir() and (Path('dataset') / args.scene).is_dir():
-            scene = Path('dataset') / args.scene
-    output = args.output or Path('frames') / scene.name
+def main(argv=None):
+    from lima3d.extraction_config import extraction_jobs
+    parser = argparse.ArgumentParser(description='Extract scene frames using FFmpeg and config.yaml.')
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('scene', nargs='?', type=Path, help='Scene name or input path (legacy CLI)')
+    selection.add_argument('--scenes', nargs='+', help='Override data.scenes')
+    parser.add_argument('--config', type=Path, help='Shared YAML; defaults to config.yaml when no scene is given')
+    parser.add_argument('--fps', type=float, help='Override extraction.fps')
+    parser.add_argument('--output', type=Path, help='Output directory for a single scene')
+    parser.add_argument('--groups', nargs='+', help='Override data.platforms')
+    parser.add_argument('--format', choices=['jpg', 'png'], help='Override extraction.format')
+    parser.add_argument('--threads', type=int, help='Override extraction.threads')
+    parser.add_argument('--dry-run', action='store_true', help='Inspect videos without writing files')
+    args = parser.parse_args(argv)
     try:
-        extract_scene(scene, output, args.fps, args.groups, args.format, args.threads, args.dry_run)
+        jobs = extraction_jobs(args)
+        for job in jobs:
+            extract_scene(**job)
     except (ValueError, RuntimeError, OSError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f'Error: {exc}\n')
 

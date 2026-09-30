@@ -72,6 +72,14 @@ class SchedulerTests(unittest.TestCase):
             with patch.object(s,'tqdm',FakeBar),patch.object(s.sys.stderr,'isatty',return_value=True),patch.object(s.os,'sched_getaffinity',return_value=set(range(8))),patch.object(s.subprocess,'Popen',FakeProcess),patch.object(s.time,'sleep'),contextlib.redirect_stdout(output):
                 failures=s.orchestrate(cfg,{'pairs','bank','sfm'})
             self.assertEqual(failures,0)
+            reports=list((cfg.output_root / '_runs').glob('*/timings.json'))
+            self.assertEqual(len(reports), 1)
+            timing=json.loads(reports[0].read_text())
+            self.assertEqual(timing['status'], 'complete')
+            self.assertEqual(len(timing['jobs']), 17)
+            self.assertTrue(all(j['finished_at'] and j['elapsed_seconds'] >= 0 for j in timing['jobs']))
+            self.assertEqual({j['coalition'] for j in timing['jobs'] if j['stage']=='sfm'},
+                             {'+'.join(c) for c in coalitions(a.platforms)})
             self.assertIn('pairs: 1/1 resolved', output.getvalue())
             self.assertIn('sfm: 14/14 resolved', output.getvalue())
             self.assertIn('skipped=14', output.getvalue())

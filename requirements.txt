@@ -14,3 +14,4 @@ matplotlib
 einops
 safetensors
 tqdm
+PyYAML

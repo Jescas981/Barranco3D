@@ -167,3 +167,170 @@ missing or incomplete required SfM output is reported as a failure.
 When output is redirected, animated bars are disabled; start/end messages and
 final counters remain available. Detailed worker logs are under `_logs/` and
 atomic current-status files are under `_tasks/` in the output root.
+
+## Frame extraction configuration
+
+```bash
+python extract_colmap_frames.py --config config.yaml --dry-run
+python extract_colmap_frames.py --config config.yaml --scenes DavidHouse
+```
+
+The extractor reads `data.datasets_root`, `data.frames_root`, `data.scenes`,
+`data.platforms`, and the `extraction` section (`fps`, `format`, `threads`).
+`scenes: null` selects all scene folders under the video input root. YAML paths
+are relative to the configuration file. If `datasets_root` is omitted, it looks
+for `datasets/`, falling back to `dataset/`.
+
+CLI options override YAML values: `--fps`, `--format`, `--threads`, `--groups`,
+`--scenes`, and `--output` (one scene only). Explicit CLI paths are relative to
+the working directory. With no scene argument or `--config`, it reads
+`config.yaml`. The original positional invocation remains available without YAML:
+`python extract_colmap_frames.py DavidHouse --fps 2`.
+
+Extraction requires only FFmpeg/ffprobe and PyYAML when using configuration;
+it does not load reconstruction models. Videos run sequentially and nonempty
+output directories are rejected. Choose another `data.frames_root` or `--output`
+to create a separate extraction without overwriting existing frames.
+
+## Job durations
+
+Each scheduler invocation writes an independent report to
+`<output_root>/_runs/<run_id>/timings.json`. Its path is printed at startup.
+The report is updated atomically as jobs start and finish; previous runs are
+preserved when you resume or repeat an experiment.
+
+Each job records `stage`, `scene`, `experiment`, `coalition` where applicable,
+`started_at`, `finished_at`, `elapsed_seconds`, `status`, resource, and log path.
+Timestamps use UTC. Duration uses a monotonic clock and measures worker wall time,
+including loading and saving, but excluding queue wait. Completion is detected
+by the scheduler's polling loop, so measurements can include a small polling delay.
+
+Jobs resolved without launching a worker have `launched: false` and zero duration.
+For example, cached SfM does not inherit the original reconstruction's duration.
+A worker that only validates cached data still records its actual runtime and
+`cached` status. Partial recomputation records the duration of this invocation,
+not the cumulative cost of previous attempts. Shared retrieval is recorded once
+under its executing experiment; bank work is shared across coalitions.
+
+The top-level `elapsed_seconds` is total invocation wall time; `stage_totals`
+contains summed job seconds and outcome counts per stage. Concurrent job times
+must not be interpreted as total wall time. Failed and gracefully interrupted
+workers retain their elapsed time. After a forced kill or power loss, an unfinished
+record remains `running` with no final duration; no duration is invented.
+
+This reporting applies to `src/build_bank_matching.py`,
+`src/build_sfm_sparser.py`, and `src/build_mvs.py`. It does not recover durations
+from older runs or time the standalone auxiliary scripts.
+
+## Per-platform regions
+
+Choose a default mode per platform and optional overrides per camera. Omitted
+platforms use `none`. Camera rules take precedence, including an explicit `none`.
+Rules apply to the same camera across selected scenes and experiments:
+
+```yaml
+regions:
+  Car:
+    mode: none
+    cameras:
+      cam0: {mode: mask, path: masks/Car/cam0/selection.png}
+      cam1: {mode: crop, box: [0, 0, 1920, 900]}
+      cam2: {mode: none}
+  Drone:
+    mode: mask
+    path: masks/drone.png  # One shared mask, same dimensions as every Drone image
+  Pedestrian:
+    mode: none
+```
+
+- `none`: unchanged images and matching behavior; existing caches remain usable.
+- `crop`: physically crops derived images without changing originals. Global/local
+  extraction, dense matching, SfM, and MVS all use these cropped images. Coordinates
+  and camera dimensions refer to the crop. JPEG crops are saved at quality 100;
+  use PNG source frames when lossless derived crops are required.
+- `mask`: preserves original pixels and dimensions. Black pixels exclude keypoints;
+  nonzero pixels allow them. Sparse features are filtered before matching, while
+  MASt3R correspondences are filtered at both endpoints before track assembly.
+  Global features and retrieval still see the original content, and MASt3R can
+  still use excluded regions as context. This mode does not mask MVS depth maps
+  or guarantee exclusion from the dense cloud.
+
+For per-image masks, replace `path` with `root: masks`. The expected filename is
+`masks/<scene>/<platform>/<subfolders>/<image_filename>.png`, including the
+original image extension, for example `masks/DavidHouse/Car/cam0/frame.jpg.png`.
+All masks for a masked platform are required and must match image dimensions.
+Paths in the YAML are relative to the YAML directory. Crop coordinates must be
+valid for every affected image; each camera selects one mode; different cameras can use different modes.
+
+Run the matching bank after changing regions. Region settings and mask contents
+select a separate snapshot, preventing stale features or reconstructions from
+being reused. Existing snapshots are preserved; raw inference caches are currently
+not shared across region variants. Derived crop inputs live under the snapshot's
+`images/` directory. Moving machines still requires the original frames, output
+scene directories, and mask files; adjust YAML paths as needed. Mask content hashes
+are independent of their absolute location.
+
+Region handling is supported by frame extraction and the three-stage
+reconstruction pipeline. The auxiliary monolithic CLI does not implement these rules.
+
+## Video region editor
+
+```bash
+python src/edit_regions.py --config config.yaml
+python extract_colmap_frames.py --config config.yaml --scenes DavidHouse --dry-run
+python extract_colmap_frames.py --config config.yaml --scenes DavidHouse
+```
+
+The editor discovers videos under `data.datasets_root` (`dataset/` by default),
+including platforms not currently enabled for reconstruction. No video path is
+required. In the browser, choose a scene, platform, camera, and video, then a
+timestamp and mode. Car subfolders such as `cam0`–`cam7` are independent cameras;
+Drone and Pedestrian each share one camera rule across their videos:
+
+- **Crop:** drag the rectangle to keep.
+- **Mask:** click polygon vertices around an area to exclude, then select
+  **Finish polygon** or press Enter. Add multiple polygons if needed.
+- **None:** disable region filtering for that platform.
+
+Use **Undo** or **Clear** to adjust the selection, then **Save to config.yaml**.
+The editor writes only the selected camera's region (or the platform rule for
+Drone/Pedestrian), preserves unrelated YAML
+settings/comments, and backs up the configuration under `.region_editor_backups/`.
+Masks are PNG files under `masks/`, named by their content; accompanying JSON
+files retain editable polygons and video provenance. Existing mask files remain
+available when a new selection is saved. The interface and exported masks use
+original encoded video coordinates, without autorotation.
+
+These are static camera rules, not object tracking. A region drawn on one Car
+video applies to videos of that camera only. Saving cam0 does not replace cam1.
+Choose representative frames; all videos sharing a rule must have compatible
+dimensions. Save or discard pending edits before switching the selected video.
+Optional CLI filters are `--scene`, `--platform`, and `--camera`; `--video`
+remains available for opening a specific file directly.
+
+### Extraction behavior
+
+The extractor reads the same `regions` section. Crops are applied by FFmpeg
+while frames are generated. `_colmap/extraction.json` records those crops;
+the staged pipeline recognizes them and does not crop a second time. Changing
+or disabling an already applied crop requires extracting into a new frame root.
+
+Mask mode preserves all image pixels and exports matching-sized PNG masks under
+`frames/<scene>/_colmap/masks/<image_relative_path>.png`. The generated standalone
+COLMAP script uses that mask directory. The staged pipeline uses configured masks;
+if their original paths are unavailable after moving the dataset, it can use the
+exported copies when the configured source rule matches the extraction manifest.
+Mask mode still does not exclude pixels from MVS depth estimation.
+
+Extraction checks shared mask dimensions and crop bounds before writing frames.
+With per-image masks (`root`), expected frame masks must already exist and are
+validated as frames are exported. Existing frame output directories are never
+overwritten. Keep the `_colmap` metadata when transferring frames between machines.
+
+### Remote machines
+
+Use `--no-browser --port 8765` on the remote machine and forward that port:
+`ssh -L 8765:127.0.0.1:8765 user@host`. Open the exact URL printed by the editor,
+including its session token, in your local browser. The server binds only to
+loopback and stops with Ctrl+C. No videos are uploaded to an external service.
+Dependencies are FFmpeg/ffprobe, Pillow, and PyYAML; GPU models are not loaded.

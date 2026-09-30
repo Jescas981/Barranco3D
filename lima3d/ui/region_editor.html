@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Platform region editor</title>
+<style>
+:root{color-scheme:dark;font:16px system-ui;background:#111827;color:#e5e7eb}body{max-width:1240px;margin:28px auto;padding:0 24px}h1{font-size:26px;margin:0 0 8px}p{line-height:1.5;color:#b6c2d4}button,select,input{font:inherit;border:1px solid #526077;border-radius:7px;padding:9px;background:#1f2937;color:inherit}button{cursor:pointer}button:disabled{opacity:.45;cursor:default}button.primary{background:#047857;border-color:#10b981}label{display:inline-flex;align-items:center;gap:8px}.toolbar{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:16px 0}#canvas{display:block;max-width:100%;height:auto;background:#030712;cursor:crosshair;touch-action:none}#stage{border:1px solid #526077;border-radius:8px;overflow:hidden}#status{white-space:pre-wrap;min-height:24px;color:#6ee7b7}#timestamp{width:90px}#seek{flex:1;min-width:180px}kbd{border:1px solid #526077;padding:1px 5px;border-radius:4px}.note{font-size:14px}#details{font-family:monospace}
+.workspace{display:grid;grid-template-columns:minmax(0,1fr) 250px;gap:16px;align-items:start}.workspace:has(#crop-panel[hidden]){grid-template-columns:1fr}#stage{padding:8px;background:#030712}#crop-panel{background:#1f2937;border:1px solid #526077;border-radius:8px;padding:16px}#crop-panel h2{font-size:18px;margin:0 0 12px}.crop-fields{display:grid;grid-template-columns:1fr 1fr;gap:12px}.crop-fields label{display:flex;flex-direction:column;align-items:stretch;gap:4px;font-size:14px}.crop-fields input{min-width:0;width:100%;box-sizing:border-box}#crop-panel .toolbar{gap:8px}#crop-panel button{font-size:14px}[hidden]{display:none!important}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid #6ee7b7;outline-offset:2px}@media(max-width:800px){.workspace{grid-template-columns:1fr}#crop-panel{width:auto}.crop-fields{grid-template-columns:repeat(3,minmax(0,1fr))}}
+</style>
+<h1>Camera region editor</h1><p id="subtitle">Loading video…</p>
+<div class="toolbar" id="sources"><label>Scene <select id="scene"></select></label><label>Platform <select id="platform"></select></label><label>Camera <select id="camera"></select></label><label>Video <select id="video" style="max-width:420px"></select></label></div>
+<div class="toolbar"><label>Mode <select id="mode"><option value="none">None</option><option value="crop">Crop — keep rectangle</option><option value="mask">Mask — exclude regions</option></select></label><label id="mask-tool">Shape <select id="shape"><option value="polygon">Polygon</option><option value="rectangle">Rectangle</option></select></label><button id="close">Finish polygon</button><button id="undo">Undo</button><button id="clear">Clear</button><button id="discard">Discard changes</button><button id="save" class="primary" disabled>Save to config.yaml</button></div>
+<p id="hint"></p><div class="workspace"><div id="stage"><canvas id="canvas" width="960" height="540" aria-label="Draw or edit regions on the video frame"></canvas></div>
+<aside id="crop-panel" hidden><h2>Crop coordinates</h2><div class="crop-fields">
+<label>Left (x)<input id="crop-left" type="number" min="0" step="1"></label><label>Top (y)<input id="crop-top" type="number" min="0" step="1"></label>
+<label>Right<input id="crop-right" type="number" min="1" step="1"></label><label>Bottom<input id="crop-bottom" type="number" min="1" step="1"></label>
+<label>Width<input id="crop-width" type="number" min="1" step="1"></label><label>Height<input id="crop-height" type="number" min="1" step="1"></label>
+</div><div class="toolbar"><button id="full-frame">Full frame</button><button id="new-crop">Draw new crop</button></div><p class="note">Original image pixels. Right and bottom are excluded. Drag a handle to resize, or drag inside to move. Width and height keep the top-left corner fixed.</p></aside></div>
+<div class="toolbar"><label>Time (s) <input id="timestamp" type="number" value="0" min="0" step="0.1"></label><input id="seek" type="range" min="0" max="1" value="0" step="0.1" aria-label="Video timestamp"><button id="load">Load frame</button></div>
+<p id="details"></p><p id="status" role="status"></p>
+<p class="note">Masks leave image pixels unchanged and exclude points/matches. Red polygons are ignored. Crops keep the green rectangle. Car rules apply only to the selected camera (cam0, cam1, etc.). Drone and Pedestrian each share one rule across their videos. Rules are static across scenes; it does not track moving objects. All affected images must have compatible dimensions.</p>
+<script src="/region_geometry.js?token=__SESSION_TOKEN__"></script>
+<script>
+const $ = id => document.getElementById(id);
+const token = new URLSearchParams(location.search).get('token');
+const G = RegionGeometry, canvas = $('canvas'), ctx = canvas.getContext('2d');
+let info, img, box=null, polygons=[], draft=[], gesture=null, maskPreview=null;
+let dirty=false, busy=false, catalog=[], activeVideo=null, history=[];
+const cropFields = ['left','top','right','bottom','width','height'];
+const fields = ['scene','platform','camera','video'];
+const url = (path, extra='') => path+'?token='+encodeURIComponent(token)+(activeVideo===null?'':'&video='+encodeURIComponent(activeVideo))+extra;
+const say = (text,error=false) => { $('status').textContent=text; $('status').style.color=error?'#fca5a5':'#6ee7b7'; };
+const clone = value => JSON.parse(JSON.stringify(value));
+function snapshot() { return clone({box,polygons,draft,mode:$('mode').value}); }
+function restore(state) { box=state.box; polygons=state.polygons; draft=state.draft; $('mode').value=state.mode; }
+function changed() { dirty=true; say('Unsaved changes'); render(); }
+function commit(before) { if(JSON.stringify(before)!==JSON.stringify(snapshot())){history.push(before);changed();}else render(); }
+function point(e) {
+  const r=canvas.getBoundingClientRect();
+  return [G.clamp((e.clientX-r.left)*canvas.width/r.width,0,canvas.width), G.clamp((e.clientY-r.top)*canvas.height/r.height,0,canvas.height)];
+}
+function scale() { return canvas.width / Math.max(1,canvas.getBoundingClientRect().width); }
+function outline(points,closed,color,vertices=true) {
+  if(!points.length)return;
+  ctx.beginPath(); points.forEach((p,i)=>i?ctx.lineTo(...p):ctx.moveTo(...p));
+  if(closed)ctx.closePath(); ctx.strokeStyle=color; ctx.lineWidth=2*scale(); ctx.stroke();
+  if(closed){ctx.fillStyle=color+'44';ctx.fill();}
+  if(vertices)for(const p of points){ctx.fillStyle=color;ctx.beginPath();ctx.arc(...p,3*scale(),0,Math.PI*2);ctx.fill();}
+}
+function syncCropFields() {
+  const b=G.valid(box)?box:[0,0,canvas.width,canvas.height];
+  const values=[...b,b[2]-b[0],b[3]-b[1]];
+  cropFields.forEach((field,i)=>{const input=$('crop-'+field);input.value=values[i];input.disabled=busy||!img||!!gesture;input.max=['left','right','width'].includes(field)?canvas.width:canvas.height;});
+}
+function render() {
+  const mode=$('mode').value;
+  $('crop-panel').hidden=mode!=='crop'; $('mask-tool').hidden=mode!=='mask';
+  $('close').hidden=mode!=='mask'||$('shape').value!=='polygon';
+  for(const field of [...fields,'load','seek','timestamp','mode','discard','shape','clear','full-frame','new-crop'])$(field).disabled=busy||!!gesture;
+  $('undo').disabled=busy||!!gesture||!history.length;
+  $('close').disabled=busy||!!gesture||draft.length<3;
+  $('save').disabled=busy||!img||!!gesture||!!draft.length||(mode==='crop'&&!G.valid(box))||(mode==='mask'&&!polygons.length);
+  $('hint').textContent=mode==='crop'?'Drag the corner or edge handles to resize. Drag inside to move, or edit the coordinates on the right.':mode==='mask'?($('shape').value==='rectangle'?'Drag a rectangle over the area to IGNORE. Release to add it; rectangles and polygons can be combined.':'Click vertices around an area to IGNORE. Finish polygon (or Enter), then draw another.'):'No regions will be excluded.';
+  syncCropFields();
+  if(!img)return;
+  ctx.clearRect(0,0,canvas.width,canvas.height); ctx.drawImage(img,0,0,canvas.width,canvas.height);
+  if(mode==='mask'){polygons.forEach(p=>outline(p,true,'#f87171'));outline(draft,false,'#fbbf24');if(maskPreview)outline(G.polygon(maskPreview),true,'#fbbf24');}
+  if(mode==='crop'&&box){
+    outline(G.polygon(box),true,'#34d399',false);
+    for(const p of Object.values(G.handles(box))){const size=10*scale();ctx.fillStyle='#34d399';ctx.fillRect(p[0]-size/2,p[1]-size/2,size,size);ctx.strokeStyle='#ffffff';ctx.lineWidth=scale();ctx.strokeRect(p[0]-size/2,p[1]-size/2,size,size);}
+  }
+  $('details').textContent=`Original frame: ${canvas.width} × ${canvas.height} px`+(mode==='crop'&&box?' | Keep: ['+box.join(', ')+']':'')+(mode==='mask'?' | Excluded regions: '+polygons.length:'');
+}
+const cursors={nw:'nwse-resize',se:'nwse-resize',ne:'nesw-resize',sw:'nesw-resize',n:'ns-resize',s:'ns-resize',e:'ew-resize',w:'ew-resize',move:'move',new:'crosshair'};
+function updateGesture(p) {
+  if(gesture.kind==='crop')box=G.drag(gesture.original,gesture.handle,gesture.start,p,canvas.width,canvas.height);
+  else maskPreview=G.rectangle(gesture.start,p);
+  render();
+}
+canvas.onpointerdown=e=>{
+  if(!img||busy||gesture||e.button!==0)return;
+  const p=point(e),mode=$('mode').value;
+  if(mode==='crop'){
+    gesture={kind:'crop',handle:G.hitTest(box,p,10*scale()),start:p,original:box?[...box]:null,before:snapshot(),pointer:e.pointerId};
+    canvas.setPointerCapture(e.pointerId);updateGesture(p);
+  }else if(mode==='mask'&&$('shape').value==='rectangle'){
+    gesture={kind:'rectangle',start:p,before:snapshot(),pointer:e.pointerId};canvas.setPointerCapture(e.pointerId);updateGesture(p);
+  }else if(mode==='mask'){const before=snapshot();draft.push(p);commit(before);}
+};
+canvas.onpointermove=e=>{
+  if(gesture){if(e.pointerId===gesture.pointer)updateGesture(point(e));return;}
+  canvas.style.cursor=$('mode').value==='crop'?cursors[G.hitTest(box,point(e),10*scale())]:'crosshair';
+};
+function cancelGesture() {
+  if(!gesture)return;
+  const previous=gesture;gesture=null;maskPreview=null;restore(previous.before);
+  if(canvas.hasPointerCapture(previous.pointer))canvas.releasePointerCapture(previous.pointer);
+  render();
+}
+canvas.onpointerup=e=>{
+  if(!gesture||e.pointerId!==gesture.pointer)return;
+  updateGesture(point(e));const previous=gesture;
+  if(previous.kind==='rectangle'){if(G.valid(maskPreview))polygons.push(G.polygon(maskPreview));}
+  else if(!G.valid(box))restore(previous.before);
+  gesture=null;maskPreview=null;
+  if(canvas.hasPointerCapture(previous.pointer))canvas.releasePointerCapture(previous.pointer);
+  commit(previous.before);
+};
+canvas.onpointercancel=cancelGesture;
+canvas.onlostpointercapture=()=>{if(gesture)cancelGesture();};
+$('mode').onchange=()=>{draft=[];history=[];if($('mode').value==='crop'&&!box&&img)box=[0,0,canvas.width,canvas.height];changed();};
+$('shape').onchange=()=>{if(draft.length){$('shape').value='polygon';say('Finish the polygon or press Escape before changing shape.',true);}render();};
+$('close').onclick=()=>{if(draft.length>=3){const before=snapshot();polygons.push(draft);draft=[];commit(before);}};
+$('undo').onclick=()=>{if(history.length){restore(history.pop());changed();}};
+$('clear').onclick=()=>{const before=snapshot();if($('mode').value==='crop')box=null;else {polygons=[];draft=[];}commit(before);};
+$('full-frame').onclick=()=>{const before=snapshot();box=[0,0,canvas.width,canvas.height];commit(before);};
+$('new-crop').onclick=()=>{const before=snapshot();box=null;commit(before);say('Drag anywhere on the image to draw a new crop.');};
+cropFields.forEach(field=>$('crop-'+field).onchange=()=>{
+  const value=$('crop-'+field).valueAsNumber,before=snapshot();
+  try{box=G.edit(box,field,value,canvas.width,canvas.height);commit(before);}catch(e){syncCropFields();say(e.message,true);}
+});
+window.addEventListener('keydown',e=>{
+  if(e.key==='Enter'&&e.target===document.body&&!$('close').disabled)$('close').click();
+  if(e.key==='Escape'){if(gesture)cancelGesture();else if(draft.length){const before=snapshot();draft=[];commit(before);}}
+});
+async function load(){
+  busy=true;render();say('Decoding frame…');
+  try{
+    const r=await fetch(url('/frame','&t='+encodeURIComponent($('timestamp').value)));if(!r.ok)throw Error((await r.json()).error);
+    const blob=URL.createObjectURL(await r.blob());
+    try{const next=new Image();next.src=blob;await next.decode();img=next;canvas.width=info.width;canvas.height=info.height;}finally{URL.revokeObjectURL(blob);}
+    say(dirty?'Unsaved changes':'Draw a region or select another timestamp.');
+  }catch(e){say(e.message,true);}finally{busy=false;render();}
+}
+$('seek').oninput=()=>{$('timestamp').value=$('seek').value;};$('seek').onchange=load;
+$('timestamp').onchange=()=>{$('seek').value=$('timestamp').value;};$('load').onclick=load;
+$('save').onclick=async()=>{
+  busy=true;render();
+  try{const r=await fetch(url('/save'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({video_id:activeVideo,mode:$('mode').value,box,polygons})});const data=await r.json();if(!r.ok)throw Error(data.error);dirty=false;say('Saved '+info.platform+(info.camera?' / '+info.camera:'')+': '+JSON.stringify(data.region)+'\nConfig: '+data.config+'\nPrevious config backed up.');}
+  catch(e){say(e.message,true);}finally{busy=false;render();}
+};
+window.onbeforeunload=e=>{if(dirty){e.preventDefault();e.returnValue='';}};
+function fillSources(start){for(let i=start;i<fields.length;i++){const field=fields[i],select=$(field);let rows=catalog.filter(r=>fields.slice(0,i).every(f=>(r[f]||'')===$(f).value));let entries=i===3?rows.map(r=>[r.id,r.video]):[...new Set(rows.map(r=>r[field]||''))].map(v=>[v,v||'Single camera']);select.replaceChildren(...entries.map(([value,label])=>new Option(label,value)));}}
+async function switchVideo(){
+  activeVideo=$('video').value;busy=true;img=null;render();
+  try{const r=await fetch(url('/info'));const result=await r.json();if(!r.ok)throw Error(result.error);info=result;$('subtitle').textContent=info.scene+' · '+info.platform+(info.camera?' / '+info.camera:'')+' · '+info.video;$('seek').max=$('timestamp').max=Math.max(0,info.duration-.1);$('seek').value=$('timestamp').value=0;const initial=info.initial||{};$('mode').value=initial.mode||'none';box=initial.box||null;polygons=initial.polygons||[];draft=[];gesture=null;maskPreview=null;history=[];dirty=false;await load();if(initial.mode==='mask'&&!polygons.length)say('Existing mask has no editable polygons for this video size. Draw a replacement to save.',true);}
+  catch(e){say(e.message,true);}finally{busy=false;render();}
+}
+fields.forEach((field,index)=>$(field).onchange=()=>{if(dirty){$(field).value=field==='video'?activeVideo:(info[field]||'');say('Save or discard changes before switching cameras or videos.',true);return;}fillSources(index+1);switchVideo();});
+$('discard').onclick=()=>{dirty=false;switchVideo();};
+window.addEventListener('resize',()=>render());
+(async()=>{try{const r=await fetch(url('/catalog'));const result=await r.json();if(!r.ok)throw Error(result.error);catalog=result.videos;fillSources(0);await switchVideo();}catch(e){say(e.message,true);}})();
+</script></html>

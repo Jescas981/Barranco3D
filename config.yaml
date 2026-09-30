@@ -1,19 +1,26 @@
 data:
+  datasets_root: dataset        # Input videos, organized by scene/platform
   frames_root: frames
   output_root: outputs/coalitions
-  scenes: null                  # null = all folders under frames_root
-  platforms: [Car, Drone, Pedestrian]
+  scenes: null                  # null = all scenes under the input root of each stage
+  # platforms: [Car, Drone, Pedestrian]
+  platforms: [Car]
   device: auto                  # auto | cpu | cuda
+
+extraction:
+  fps: 2
+  format: jpg                  # jpg | png
+  threads: 1                   # FFmpeg threads; videos are processed sequentially
 
 resources:
   bank:                         # pairs + matching bank (GPU)
     gpus: 1                     # count, or list of indices: [0, 1]
     threads: 4                  # CPU cores per task
   sfm:                          # SfM (CPU only)
-    workers: 0                  # parallel coalitions; 0 = automatic
-    threads: 6                  # threads per coalition
+    workers: 12                  # parallel coalitions; 0 = automatic
+    threads: 12                  # threads per coalition
   mvs:                          # MVS (GPU)
-    gpus: 4                     # count, or list of indices: [0, 1, 2, 3]
+    gpus: 1                     # count, or list of indices: [0, 1, 2, 3]
     threads: 4                  # CPU cores per task
 
 mvs:
@@ -34,10 +41,44 @@ defaults:
 
 experiments:
   - {name: sift,   preset: sift}
-  - {name: sp-sg,  preset: sp-sg}
-  - {name: mast3r, preset: mast3r}
-  - name: sp-sg-k40-seq5
-    preset: sp-sg
-    top_k: 40
-    sequential_window: 5
-    mvs: false
+  # - {name: sp-sg,  preset: sp-sg}
+  # - {name: mast3r-aerialmd, preset: mast3r-aerialmd}
+  # - name: sp-sg-k40-seq5
+  #   preset: sp-sg
+  #   top_k: 40
+  #   sequential_window: 5
+  #   mvs: false
+
+# Optional per-platform and per-camera input regions. Defaults preserve existing caches.
+regions:
+  Car:
+    mode: none
+    cameras:
+      cam0:
+        mode: mask
+        path: masks/Car/cam0/fb649c949de88ce4.png
+      cam1:
+        mode: mask
+        path: masks/Car/cam1/e87c15d657b74685.png
+      cam2:
+        mode: mask
+        path: masks/Car/cam2/a2c65e9a05a4981a.png
+      cam3:
+        mode: mask
+        path: masks/Car/cam3/7bcd04c4d27c455b.png
+      cam4:
+        mode: mask
+        path: masks/Car/cam4/869dc51a3ec30a74.png
+      cam5:
+        mode: mask
+        path: masks/Car/cam5/89fa38991a53e500.png
+      cam6:
+        mode: mask
+        path: masks/Car/cam6/f367b78609059390.png
+      cam7:
+        mode: mask
+        path: masks/Car/cam7/fdad131d63db3e2c.png
+  Drone:
+    mode: none
+  Pedestrian:
+    mode: none

@@ -39,7 +39,9 @@ def portable_context(scene, args):
             checksum = checksum or file_hash(path)
             files[name] = {'stat': identity, 'sha256': checksum}
             rows.append([name, stat.st_size, checksum])
-        signature = digest({'images': rows})
+        from .regions import region_identity, effective_regions
+        regions = region_identity(scene, names, effective_regions(scene, getattr(args, 'regions', {}), args.platforms))
+        signature = digest({'images': rows, **({'regions': regions} if regions else {})})
         root = parent / signature
         # Adoptar snapshots antiguos sin mover ni duplicar sus HDF5.
         candidates = sorted(parent.glob('*/dataset.json'))
@@ -50,10 +52,10 @@ def portable_context(scene, args):
                 break
         else:
             legacy = parent / legacy_snapshot
-            if (legacy / 'dataset.json').is_file():
+            if not regions and (legacy / 'dataset.json').is_file():
                 root = legacy
         dataset = {'scene': str(scene), 'snapshot': root.name,
-                   'content_signature': signature, 'images': images, 'files': rows}
+                   'content_signature': signature, 'images': images, 'files': rows, 'regions': regions}
         save_json(root / 'dataset.json', dataset)
         save_json(index_path, {'source': str(scene), 'files': files})
     return images, root.name, names, root

@@ -13,6 +13,8 @@ import traceback
 from pathlib import Path
 
 from .utils.paths import REPO_ROOT
+from .utils.timing import RunTimings
+from .regions import prepared_scene
 from .utils.progress import StageCounts, read_status
 
 try:
@@ -124,6 +126,18 @@ def make_slots(res, stages):
 
 # ------------------------------------------------------------------ orquestador
 def orchestrate(cfg, stages):
+    timings = RunTimings(cfg.output_root, stages, cfg.path)
+    print(f'Timing report: {timings.path}', flush=True)
+    try:
+        failures = _orchestrate(cfg, stages, timings)
+    except BaseException as exc:
+        timings.close('interrupted' if isinstance(exc, KeyboardInterrupt) else 'failed')
+        raise
+    timings.close('failed' if failures else 'complete')
+    return failures
+
+
+def _orchestrate(cfg, stages, timings):
     out = cfg.output_root
     log_dir, task_dir = out / '_logs', out / '_tasks'
     for d in (log_dir, task_dir):
@@ -139,7 +153,8 @@ def orchestrate(cfg, stages):
     info = {}
     for scene in cfg.scenes:
         _, _, names, root = context(scene, first)
-        info[scene.name] = {'root': root, 'n': len(names), 'scene': scene}
+        info[scene.name] = {'root': root, 'n': len(names),
+                            'scene': prepared_scene(scene, first, root, names)}
 
     ready = {'gpu': [], 'cpu': []}
     running, busy, runs, failures = [], {}, {}, []
@@ -243,6 +258,8 @@ def orchestrate(cfg, stages):
             kind = 'sfm' if 'sfm' in stages else 'mvs'
             counts[kind].add()
             finish(kind, 'failed')
+            timings.skipped(kind, f'{sname}-{exp}', status='failed', scene=sname,
+                            experiment=exp, reason='Missing matching bank manifest')
             fail(f'{sname}/{exp}', f'falta {path}; corre build_bank_matching.py')
             return
         man = json.loads(path.read_text())
@@ -251,9 +268,12 @@ def orchestrate(cfg, stages):
         if str(run_root) in expanded_runs:
             for kind in ('sfm', 'mvs'):
                 if kind in stages and (kind != 'mvs' or args.mvs):
-                    for _ in man['jobs']:
+                    for duplicate in man['jobs']:
                         counts[kind].add()
                         finish(kind, 'skipped')
+                        timings.skipped(kind, f'{sname}-{exp}-{duplicate["label"]}',
+                                        scene=sname, experiment=exp, coalition=duplicate['label'],
+                                        reason='Equivalent reconstruction already scheduled')
             say(f'[CACHE] Experimento equivalente: {exp} -> {run_root.name}')
             return
         expanded_runs.add(str(run_root))
@@ -274,12 +294,18 @@ def orchestrate(cfg, stages):
                 elif args.mvs:
                     counts['mvs'].add()
                     finish('mvs', 'failed')
+                    timings.skipped('mvs', f'{sname}-{exp}-{job["label"]}', status='failed',
+                                    scene=sname, experiment=exp, coalition=job['label'],
+                                    reason='Missing or incomplete SfM')
                     fail(f'mvs/{sname}/{exp}/{job["label"]}', 'SfM pendiente o incompleto; ejecuta build_sfm_sparser.py')
 
     def submit_sfm(sname, exp, job):
         counts['sfm'].add()
         cached = cached_result(Path(job['run_root']) / job['label'])
         if cached is not None:
+            timings.skipped('sfm', f'{sname}-{exp}-{job["label"]}', status='cached',
+                            scene=sname, experiment=exp, coalition=job['label'],
+                            result_status=cached['status'], reason='Existing SfM result')
             sfm_finished(sname, exp, job, cached, cached=True)
             return
         tid = f'{sname}-{exp}-{job["label"]}'
@@ -322,6 +348,8 @@ def orchestrate(cfg, stages):
         counts['mvs'].add()
         if res['status'] != 'complete':
             finish('mvs', 'skipped')
+            timings.skipped('mvs', f'{sname}-{exp}-{job["label"]}', scene=sname,
+                            experiment=exp, coalition=job['label'], reason=res['status'])
             return
         model = Path(job['run_root']) / job['label'] / res['model_path']
         try:
@@ -347,6 +375,8 @@ def orchestrate(cfg, stages):
             fail(f'pairs/{sname}/{exp}', 'ver log')
             if bank:
                 finish('bank', 'skipped')
+                timings.skipped('bank', f'{sname}-{exp}', scene=sname, experiment=exp,
+                                reason='Pair selection failed')
                 failures.append(f'bank/{sname}/{exp}: omitido (fallaron los pares)')
             return
         if bank:
@@ -429,6 +459,15 @@ def orchestrate(cfg, stages):
         env['PYTHONUNBUFFERED'] = '1'
         task.started = time.monotonic()
         task.location = f'GPU {env.get("CUDA_VISIBLE_DEVICES", gpu)}' if gpu is not None else f'CPU cores {cores}'
+        scene_name = task.cmd[task.cmd.index('--scene') + 1]
+        experiment = task.cmd[task.cmd.index('--experiment') + 1]
+        coalition = None
+        if task.kind in ('sfm', 'mvs'):
+            coalition = task.name[len(f'{scene_name}-{experiment}-'):]
+        task.timing_id = timings.start(task.kind, task.name, scene=scene_name,
+                                       experiment=experiment, coalition=coalition,
+                                       resource=task.location, launched=True,
+                                       log=str(log_dir / f'{task.kind}-{task.name}.log'))
         pin = (lambda: os.sched_setaffinity(0, cores)) if cores else None
         with (log_dir / f'{task.kind}-{task.name}.log').open('a') as log:
             task.log_offset = log.tell()
@@ -436,6 +475,8 @@ def orchestrate(cfg, stages):
                                     stderr=subprocess.STDOUT, preexec_fn=pin, start_new_session=True)
         if gpu is None:
             task.location = f'CPU worker {proc.pid} | cores {cores}'
+        timings.data['jobs'][task.timing_id].update(pid=proc.pid, resource=task.location)
+        timings.flush()
         if task.group:
             busy[task.group] = -1 if task.mode == 'w' else busy.get(task.group, 0) + 1
         running.append((proc, task, slot))
@@ -473,6 +514,14 @@ def orchestrate(cfg, stages):
                 running.remove(item)
                 (gpu_free if task.resource == 'gpu' else cpu_free).append(slot)
                 release(task)
+                outcome = worker_outcome(task.kind, task.name, code == 0)
+                result_status = None
+                if task.kind == 'sfm':
+                    result = read_status(task_dir / f'sfm-{task.name}.result.json')
+                    result_status = result.get('status')
+                    outcome = ('failed' if code != 0 or result_status not in ('complete', 'no_model')
+                               else 'skipped' if result_status == 'no_model' else 'completed')
+                timings.finish(task.timing_id, outcome, exit_code=code, result_status=result_status)
                 if task.kind != 'sfm' or code != 0:
                     say(f'{stamp()} END   {task.kind} {task.name} (exit {code})')
                 task.done(code == 0)

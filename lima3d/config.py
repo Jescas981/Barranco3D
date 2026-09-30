@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 from .pipeline import PRESETS, build_parser, validate
 
-TOP = {'data', 'resources', 'mvs', 'defaults', 'experiments'}
-DATA = {'frames_root', 'output_root', 'scenes', 'platforms', 'device'}
+TOP = {'data', 'resources', 'mvs', 'defaults', 'experiments', 'extraction', 'regions'}
+DATA = {'datasets_root', 'frames_root', 'output_root', 'scenes', 'platforms', 'device'}
 RES = {'bank', 'sfm', 'mvs'}
 GPU_RES = {'gpus', 'threads'}
 SFM_RES = {'workers', 'threads'}
@@ -93,6 +93,8 @@ def load_config(path, only_experiments=None, only_scenes=None, dry_run=False):
         ns.platforms = data.get('platforms', ns.platforms)
         if not isinstance(ns.platforms, list) or not ns.platforms:
             raise ValueError('config: platforms debe ser una lista no vacía')
+        from .regions import parse_regions
+        ns.regions = parse_regions(raw.get('regions'), path.parent, ns.platforms)
         ns.device = data.get('device', 'auto')
         ns.configs = [preset]
         for key in OPTIONS - {'mvs'}:

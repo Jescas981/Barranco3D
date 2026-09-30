@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location('extractor', Path(__file__).resolve().parents[1] / 'extract_colmap_frames.py')
 m = importlib.util.module_from_spec(spec)
@@ -52,6 +53,66 @@ class ExtractionTests(unittest.TestCase):
             for fps in (0, -1, float('nan'), 20):
                 with self.assertRaises(ValueError):
                     m.extract_scene(scene, root / 'invalid', fps)
+
+
+class ExtractionConfigTests(unittest.TestCase):
+    def make_config(self, root, extra=''):
+        for scene in ('A', 'B'):
+            (root / 'videos' / scene).mkdir(parents=True)
+        config = root / 'config.yaml'
+        config.write_text('data:\n  datasets_root: videos\n  frames_root: images\n'
+                          '  scenes: null\n  platforms: [Car, Drone]\n'
+                          'extraction:\n  fps: 0.5\n  format: png\n  threads: 2\n' + extra)
+        return config
+
+    def test_yaml_paths_and_all_scenes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); config = self.make_config(root)
+            with patch.object(m, 'extract_scene') as extract:
+                m.main(['--config', str(config), '--dry-run'])
+            self.assertEqual(extract.call_count, 2)
+            job = extract.call_args_list[0].kwargs
+            self.assertEqual(job['scene'], root / 'videos/A')
+            self.assertEqual(job['output'], root / 'images/A')
+            self.assertEqual((job['fps'], job['image_format'], job['threads']), (0.5, 'png', 2))
+            self.assertEqual(job['groups'], ['Car', 'Drone'])
+            self.assertTrue(job['dry_run'])
+            self.assertFalse((root / 'images').exists())
+
+    def test_cli_overrides(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); config = self.make_config(root)
+            with patch.object(m, 'extract_scene') as extract:
+                m.main(['--config', str(config), '--scenes', 'B', '--fps', '3',
+                        '--format', 'jpg', '--threads', '4', '--groups', 'Drone',
+                        '--output', str(root / 'custom')])
+            job = extract.call_args.kwargs
+            self.assertEqual(job['scene'].name, 'B')
+            self.assertEqual((job['fps'], job['image_format'], job['threads']), (3, 'jpg', 4))
+            self.assertEqual(job['groups'], ['Drone'])
+            self.assertEqual(job['output'], root / 'custom')
+
+    def test_rejects_nonempty_output_before_any_extraction(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); config = self.make_config(root)
+            (root / 'images/B').mkdir(parents=True)
+            (root / 'images/B/existing.jpg').write_bytes(b'existing')
+            with patch.object(m, 'extract_scene') as extract, contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    m.main(['--config', str(config)])
+                extract.assert_not_called()
+
+    def test_legacy_cli_and_invalid_options(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); config = self.make_config(root)
+            with patch.object(m, 'extract_scene') as extract:
+                m.main([str(root / 'videos/A'), '--fps', '2', '--output', str(root / 'legacy')])
+            self.assertEqual(extract.call_args.kwargs['fps'], 2)
+            for options in (['--fps', '0'], ['--threads', '0'], ['--output', str(root / 'ambiguous')]):
+                with patch.object(m, 'extract_scene') as extract, contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        m.main(['--config', str(config), *options])
+                    extract.assert_not_called()
 
 
 if __name__ == '__main__':

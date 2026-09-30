@@ -3,9 +3,12 @@
 /other/
 /data/
 /frames/
+.codex/
+.agents/
 .vscode/
 .venv/
 /dataset
 /datasets
 /outputs/
-
+.region_editor_backups/
+.region-editor.lock
