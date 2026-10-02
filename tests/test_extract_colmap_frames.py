@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location('extractor', Path(__file__).resolve().parents[1] / 'extract_colmap_frames.py')
+spec = importlib.util.spec_from_file_location('extractor', Path(__file__).resolve().parents[1] / 'extract_frames.py')
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 

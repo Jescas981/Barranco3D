@@ -9,6 +9,7 @@
 .venv/
 /dataset
 /datasets
+/flow_distribution
 /outputs/
 .region_editor_backups/
 .region-editor.lock

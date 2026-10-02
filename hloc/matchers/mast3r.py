@@ -104,6 +104,11 @@ class Mast3r(BaseModel):
         self.match_conf = 0.3
 
     def _forward(self, data):
+        if data['image0'].shape[0] != 1:
+            raise ValueError('Use forward_batch for multiple MASt3R pairs')
+        return self.forward_batch(data)[0]
+
+    def forward_batch(self, data):
 
         image0 = data["image0"]
         image1 = data["image1"]
@@ -114,19 +119,19 @@ class Mast3r(BaseModel):
         view1 = {
             "img": image0,
             "true_shape": torch.tensor(
-                [[H0, W0]],
+                [[H0, W0]] * image0.shape[0],
                 device=image0.device,
             ),
-            "instance": ["1"],
+            "instance": [str(i) for i in range(image0.shape[0])],
         }
 
         view2 = {
             "img": image1,
             "true_shape": torch.tensor(
-                [[H1, W1]],
+                [[H1, W1]] * image1.shape[0],
                 device=image1.device,
             ),
-            "instance": ["2"],
+            "instance": [str(i) for i in range(image1.shape[0])],
         }
 
         with torch.no_grad():
@@ -138,11 +143,15 @@ class Mast3r(BaseModel):
         device = image0.device
 
 
+        return [self._correspondences(pred1, pred2, i, view1, view2, device)
+                for i in range(image0.shape[0])]
+
+    def _correspondences(self, pred1, pred2, index, view1, view2, device):
         corres = extract_correspondences_nonsym(
-            pred1["desc"][0],
-            pred2["desc"][0],
-            pred1["desc_conf"][0].detach().cpu().numpy(),
-            pred2["desc_conf"][0].detach().cpu().numpy(),
+            pred1["desc"][index],
+            pred2["desc"][index],
+            pred1["desc_conf"][index].detach().cpu().numpy(),
+            pred2["desc_conf"][index].detach().cpu().numpy(),
             device=device,
             subsample=self.subsample,
             pixel_tol=self.pixel_tol,

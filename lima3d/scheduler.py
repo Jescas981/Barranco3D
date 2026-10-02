@@ -59,7 +59,7 @@ def run_worker(a):
             from .mvs import run_mvs
             job = json.loads(Path(a.task_json).read_text())
             m = cfg.mvs  # CUDA_VISIBLE_DEVICES expone una sola GPU: para COLMAP es la 0
-            run_mvs(Path(job['model']), Path(job['images']), None, colmap=m['colmap'],
+            run_mvs(Path(job['model']), Path(job['images']), None,
                     max_image_size=m['max_image_size'], cache_gb=m['cache_gb'],
                     threads=cfg.res['mvs']['threads'], gpu_index='0',
                     num_sources=m['num_sources'])
@@ -567,6 +567,9 @@ def describe(cfg, stages):
     for name, a in cfg.experiments.items():
         print(f'  - {name}: preset={a.configs[0]} global={a.global_feature} top_k={a.top_k} '
               f'seq={a.sequential_window} kp={a.max_keypoints} mvs={a.mvs}')
+        from .execution import execution_options
+        for operation in ('global', 'local', 'matching', 'dense'):
+            print(f'      {operation}: {execution_options(a, operation)}')
     first = next(iter(cfg.experiments.values()))
     for scene in cfg.scenes:
         run_scene(scene, first)

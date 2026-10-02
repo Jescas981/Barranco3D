@@ -32,12 +32,12 @@ class DenseTests(unittest.TestCase):
                 resize_max=1024,max_keypoints=100,until='sfm',top_k=2,
                 query_batch=2,database_batch=2,device='cpu',threads=1,
                 seed=0,camera_mode='PER_FOLDER')
-            def features(conf, scene, names, path, global_features):
+            def features(conf, scene, names, path, global_features, **kwargs):
                 self.assertTrue(global_features)
                 path.parent.mkdir(parents=True,exist_ok=True)
                 with h5py.File(path,'w') as f:
                     for name in names: f.create_dataset(name+'/global_descriptor',data=np.ones(4))
-            def raw(conf,scene,pairs,path,device):
+            def raw(conf,scene,pairs,path,device,**kwargs):
                 path.parent.mkdir(parents=True,exist_ok=True)
                 with h5py.File(path,'w') as f:
                     from hloc.utils.parsers import names_to_pair
@@ -73,6 +73,8 @@ class DenseTests(unittest.TestCase):
                 return {'keypoints0': torch.tensor([[4.,4.], [8.,8.]]),
                         'keypoints1': torch.tensor([[5.,4.], [9.,8.]]),
                         'scores': torch.tensor([.8,.9])}
+            def forward_batch(self, data):
+                return [self.forward({'image0': image[None]}) for image in data['image0']]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             names = ['Car/a.jpg', 'Drone/b.jpg', 'Pedestrian/c.jpg']
@@ -92,6 +94,17 @@ class DenseTests(unittest.TestCase):
                     del f[names_to_pair(*pairs[1])]['scores']
                 dense.ensure_dense_raw(dense.dense_config('mast3r'),root,pairs,raw,'cpu')
                 self.assertEqual(len(calls),3)
+                batched = root/'batched.h5'
+                dense.ensure_dense_raw(dense.dense_config('mast3r'),root,pairs,batched,'cpu',
+                                       batch_size=2,loader_workers=2,prefetch=2)
+                with h5py.File(raw) as single, h5py.File(batched) as batch:
+                    for pair in pairs:
+                        key = names_to_pair(*pair)
+                        for field in ('keypoints0','keypoints1','scores'):
+                            np.testing.assert_array_equal(single[key][field][...],batch[key][field][...])
+                before = len(calls)
+                dense.ensure_dense_raw(dense.dense_config('mast3r'),root,pairs,batched,'cpu',batch_size=4)
+                self.assertEqual(len(calls),before)
                 # Un par externo con coordenadas distintas no debe influir en Car+Drone.
                 with h5py.File(raw,'a') as f:
                     f[names_to_pair(*pairs[1])]['keypoints0'][...] = [[20,20],[24,24]]

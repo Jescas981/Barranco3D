@@ -238,6 +238,11 @@ def main(
     image_list: Optional[Union[Path, List[str]]] = None,
     feature_path: Optional[Path] = None,
     overwrite: bool = False,
+    batch_size: int = 1,
+    loader_workers: int = 1,
+    prefetch: int = 4,
+    workers: int = 1,
+    max_in_flight: int = 1,
 ) -> Path:
     logger.info(
         "Extracting local features with configuration:" f"\n{pprint.pformat(conf)}"
@@ -257,51 +262,62 @@ def main(
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     Model = dynamic_load(extractors, conf["model"]["name"])
-    model = Model(conf["model"]).eval().to(device)
 
-    loader = torch.utils.data.DataLoader(
-        dataset, num_workers=1, shuffle=False, pin_memory=True
-    )
-    for idx, data in enumerate(tqdm(loader)):
-        name = dataset.names[idx]
-        pred = model({"image": data["image"].to(device, non_blocking=True)})
-        pred = {k: v[0].cpu().numpy() for k, v in pred.items()}
-
-        pred["image_size"] = original_size = data["original_size"][0].numpy()
-        if "keypoints" in pred:
-            size = np.array(data["image"].shape[-2:][::-1])
-            scales = (original_size / size).astype(np.float32)
-            pred["keypoints"] = (pred["keypoints"] + 0.5) * scales[None] - 0.5
-            if "scales" in pred:
-                pred["scales"] *= scales.mean()
-            # add keypoint uncertainties scaled to the original resolution
-            uncertainty = getattr(model, "detection_noise", 1) * scales.mean()
-
-        if as_half:
-            for k in pred:
-                dt = pred[k].dtype
-                if (dt == np.float32) and (dt != np.float16):
-                    pred[k] = pred[k].astype(np.float16)
-
-        with h5py.File(str(feature_path), "a", libver="latest") as fd:
-            try:
-                if name in fd:
-                    del fd[name]
-                grp = fd.create_group(name)
-                for k, v in pred.items():
-                    grp.create_dataset(k, data=v)
+    from lima3d.utils.batching import prefetched, compatible_batches
+    if batch_size > 1 and conf['model']['name'] not in ('superpoint', 'netvlad'):
+        raise ValueError('Tensor batches currently support SuperPoint and NetVLAD; use workers with batch_size=1 for other extractors')
+    batches = compatible_batches(enumerate(prefetched(dataset, loader_workers, prefetch)),
+                                 batch_size, lambda item: tuple(item[1]['image'].shape))
+    from copy import deepcopy
+    from lima3d.utils.batching import inference_jobs
+    def infer(model, batch):
+        images = torch.stack([torch.as_tensor(item[1]['image']) for item in batch]).to(device)
+        predictions = model({'image': images})
+        return [(idx, data, {k: v[row].detach().cpu().numpy() for k, v in predictions.items()},
+                 getattr(model, 'detection_noise', 1)) for row, (idx, data) in enumerate(batch)]
+    jobs = inference_jobs(lambda: Model(deepcopy(conf['model'])).eval().to(device), infer,
+                          batches, workers, max_in_flight, device)
+    logger.info(f'Execution: batch_size={batch_size}, workers={workers}, max_in_flight={max_in_flight}')
+    with tqdm(total=len(dataset), unit='images') as progress:
+        for batch in jobs:
+            for idx, data, pred, detection_noise in batch:
+                name = dataset.names[idx]
+                pred["image_size"] = original_size = np.asarray(data["original_size"])
                 if "keypoints" in pred:
-                    grp["keypoints"].attrs["uncertainty"] = uncertainty
-            except OSError as error:
-                if "No space left on device" in error.args[0]:
-                    logger.error(
-                        "Out of disk space: storing features on disk can take "
-                        "significant space, did you enable the as_half flag?"
-                    )
-                    del grp, fd[name]
-                raise error
+                    size = np.array(data["image"].shape[-2:][::-1])
+                    scales = (original_size / size).astype(np.float32)
+                    pred["keypoints"] = (pred["keypoints"] + 0.5) * scales[None] - 0.5
+                    if "scales" in pred:
+                        pred["scales"] *= scales.mean()
+                    # add keypoint uncertainties scaled to the original resolution
+                    uncertainty = detection_noise * scales.mean()
 
-        del pred
+                if as_half:
+                    for k in pred:
+                        dt = pred[k].dtype
+                        if (dt == np.float32) and (dt != np.float16):
+                            pred[k] = pred[k].astype(np.float16)
+
+                with h5py.File(str(feature_path), "a", libver="latest") as fd:
+                    try:
+                        if name in fd:
+                            del fd[name]
+                        grp = fd.create_group(name)
+                        for k, v in pred.items():
+                            grp.create_dataset(k, data=v)
+                        if "keypoints" in pred:
+                            grp["keypoints"].attrs["uncertainty"] = uncertainty
+                    except OSError as error:
+                        if "No space left on device" in error.args[0]:
+                            logger.error(
+                                "Out of disk space: storing features on disk can take "
+                                "significant space, did you enable the as_half flag?"
+                            )
+                            del grp, fd[name]
+                        raise error
+
+                del pred
+                progress.update(1)
 
     logger.info("Finished exporting features.")
     return feature_path

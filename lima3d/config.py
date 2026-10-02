@@ -10,8 +10,8 @@ DATA = {'datasets_root', 'frames_root', 'output_root', 'scenes', 'platforms', 'd
 RES = {'bank', 'sfm', 'mvs'}
 GPU_RES = {'gpus', 'threads'}
 SFM_RES = {'workers', 'threads'}
-MVS = {'enabled', 'colmap', 'max_image_size', 'cache_gb', 'num_sources'}
-OPTIONS = {'global_feature', 'top_k', 'sequential_window', 'query_batch', 'database_batch',
+MVS = {'enabled', 'max_image_size', 'cache_gb', 'num_sources'}
+OPTIONS = {'execution', 'local_batch_size', 'dense_batch_size', 'loader_workers', 'prefetch', 'global_feature', 'top_k', 'sequential_window', 'query_batch', 'database_batch',
            'resize_max', 'max_keypoints', 'seed', 'sift_device', 'camera_mode', 'mvs'}
 CHOICES = {'global_feature': ['netvlad', 'openibl', 'megaloc', 'dir'],
            'camera_mode': ['PER_FOLDER', 'PER_IMAGE'],
@@ -56,7 +56,7 @@ def load_config(path, only_experiments=None, only_scenes=None, dry_run=False):
             or res['sfm']['threads'] < 1 or res['sfm']['workers'] < 0):
         raise ValueError('config: resources inválido (threads deben ser > 0, workers >= 0)')
 
-    mvs = {'enabled': True, 'colmap': 'colmap', 'max_image_size': 1024, 'cache_gb': 2.0,
+    mvs = {'enabled': True, 'max_image_size': 1024, 'cache_gb': 2.0,
            'num_sources': 10, **_section(raw.get('mvs'), MVS, 'mvs')}
     defaults = _section(raw.get('defaults'), OPTIONS, 'defaults')
     entries = raw.get('experiments')
@@ -70,6 +70,11 @@ def load_config(path, only_experiments=None, only_scenes=None, dry_run=False):
     for entry in entries:
         entry = _section(entry, OPTIONS | {'name', 'preset'}, 'experiments')
         merged = {**defaults, **entry}
+        from .execution import validate_execution
+        default_execution = validate_execution(defaults.get('execution'))
+        override_execution = validate_execution(entry.get('execution'))
+        merged['execution'] = {op: {**default_execution.get(op, {}), **override_execution.get(op, {})}
+                               for op in default_execution.keys() | override_execution.keys()}
         name, preset = merged.get('name'), merged.get('preset')
         if not name or not re.fullmatch(r'[A-Za-z0-9_.-]+', str(name)):
             raise ValueError(f'config: nombre de experimento inválido: {name!r}')

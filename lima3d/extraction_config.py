@@ -2,7 +2,7 @@
 import math
 from pathlib import Path
 
-EXTRACTION_KEYS = {'fps', 'format', 'threads'}
+EXTRACTION_KEYS = {'fps', 'format', 'threads', 'strategy', 'optical_flow'}
 
 
 def extraction_jobs(args):
@@ -29,8 +29,20 @@ def extraction_jobs(args):
     unknown = set(settings) - EXTRACTION_KEYS
     if unknown:
         raise ValueError(f'Unknown extraction settings: {sorted(unknown)}')
+    from .optical_flow import validate_options
+    strategy = getattr(args, 'strategy', None) or settings.get('strategy', 'fps')
+    if strategy not in ('fps', 'optical_flow', 'hybrid'):
+        raise ValueError('extraction.strategy must be fps, optical_flow or hybrid')
+    flow = validate_options(settings.get('optical_flow'))
+    threshold = getattr(args, 'mode_threshold_px', None)
+    if threshold is not None:
+        if strategy not in ('optical_flow', 'hybrid'):
+            raise ValueError('--mode-threshold-px requires --strategy optical_flow or hybrid')
+        flow = validate_options({**flow, 'mode_threshold_px': threshold})
     fps = args.fps if args.fps is not None else settings.get('fps')
-    if isinstance(fps, bool) or not isinstance(fps, (int, float)) or not math.isfinite(fps) or fps <= 0:
+    if strategy == 'optical_flow':
+        fps = None
+    elif isinstance(fps, bool) or not isinstance(fps, (int, float)) or not math.isfinite(fps) or fps <= 0:
         raise ValueError('Set a finite positive extraction.fps or --fps')
     threads = args.threads if args.threads is not None else settings.get('threads', 1)
     if type(threads) is not int or threads < 1:
@@ -83,6 +95,7 @@ def extraction_jobs(args):
             raise ValueError('Output cannot be the input scene or its ancestor')
         if output.exists() and (not output.is_dir() or any(output.iterdir())):
             raise ValueError(f'Output must be new or empty: {output}')
-        jobs.append(dict(scene=scene, output=output, fps=float(fps), groups=groups,
+        jobs.append(dict(scene=scene, output=output, fps=float(fps) if fps is not None else None, groups=groups,
+                         strategy=strategy, optical_flow=flow,
                          image_format=image_format, threads=threads, dry_run=args.dry_run, regions=regions))
     return jobs

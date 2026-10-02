@@ -1,0 +1,13 @@
+const assert = require('node:assert/strict');
+const g = require('../lima3d/ui/region_geometry.js');
+const box = [10,20,70,80];
+assert.deepEqual(g.drag(box,'nw',[10,20],[-5,-5],100,100),[0,0,70,80]);
+assert.deepEqual(g.drag(box,'se',[70,80],[0,0],100,100),[10,20,11,21]);
+assert.deepEqual(g.drag(box,'move',[40,40],[100,100],100,100),[40,40,100,100]);
+assert.deepEqual(g.edit(box,'width',100,100,100),[10,20,100,80]);
+assert.deepEqual(g.edit(box,'height',30,100,100),[10,20,70,50]);
+assert.throws(()=>g.edit(box,'left',1.5,100,100));
+assert.equal(g.hitTest(box,[10,20],3),'nw');
+assert.equal(g.hitTest(box,[40,40],3),'move');
+assert.deepEqual(g.polygon(g.rectangle([70,80],[10,20])),[[10,20],[70,20],[70,80],[10,80]]);
+console.log('Crop and rectangle geometry checks passed');

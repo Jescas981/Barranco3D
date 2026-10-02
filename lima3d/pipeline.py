@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 
+from .execution import execution_options, validate_execution
 from .utils.paths import REPO_ROOT
 from .utils.io import digest, save_json, scene_lock
 import random
@@ -81,7 +82,7 @@ def resolve_sift_device(requested, cuda_compiled, cuda_available):
     return 'cpu'
 
 
-def extract_sift(conf, scene, names, path, device='cpu', threads=1):
+def extract_sift(conf, scene, names, path, device='cpu', threads=1, batch_size=1, loader_workers=1, prefetch=4, workers=1, max_in_flight=1):
     """SIFT de COLMAP directamente: no necesita Kornia ni pesos descargables."""
     import h5py
     import numpy as np
@@ -91,34 +92,28 @@ def extract_sift(conf, scene, names, path, device='cpu', threads=1):
     selected_device = resolve_sift_device(device, pycolmap.has_cuda, torch.cuda.is_available())
     print(f'  SIFT device: {selected_device} (pycolmap CUDA: {pycolmap.has_cuda})', flush=True)
     options = {**conf['model'].get('options', {}), 'normalization': pycolmap.Normalization.L2}
-    extractor = pycolmap.FeatureExtractor.create(
-        options=pycolmap.FeatureExtractionOptions(num_threads=threads,
-                    use_gpu=selected_device == 'cuda', sift=pycolmap.SiftExtractionOptions(options)),
-        device=getattr(pycolmap.Device, selected_device))
+    from .utils.batching import prefetched, compatible_batches
+    from .sift_worker import extract_batches
     dataset = ImageDataset(scene, conf['preprocessing'], names)
-    for index in range(len(dataset)):
-        data = dataset[index]
-        gray = data['image'][0]
-        bitmap = pycolmap.Bitmap.from_array(np.rint(gray * 255).clip(0, 255).astype(np.uint8))
-        raw_keypoints, raw_descriptors = extractor.extract(bitmap)
-        keypoints = np.asarray([(p.x, p.y) for p in raw_keypoints], dtype=np.float32).reshape(-1, 2)
-        descriptors = np.asarray(raw_descriptors.to_float().data, dtype=np.float32)
-        scales = data['original_size'] / np.array(gray.shape[::-1])
-        keypoints = (keypoints + 0.5) * scales[None] - 0.5
-        descriptors = descriptors / np.maximum(np.linalg.norm(descriptors, axis=1, keepdims=True), 1e-8)
-        with h5py.File(path, 'a') as features:
-            group = features.create_group(names[index])
-            points = group.create_dataset('keypoints', data=keypoints.astype(np.float32))
-            points.attrs['uncertainty'] = float(scales.mean())
-            group.create_dataset('descriptors', data=descriptors.T.astype(np.float16))
-            group.create_dataset('scores', data=np.zeros(len(keypoints), dtype=np.float16))
-            group.create_dataset('image_size', data=data['original_size'])
-        if (index + 1) % 100 == 0 or index + 1 == len(dataset):
-            print(f'  SIFT {index + 1}/{len(dataset)}', flush=True)
-        emit_progress('SIFT extraction', index + 1, len(dataset), 'images', work=True)
+    batches = compatible_batches(enumerate(prefetched(dataset, loader_workers, prefetch)), batch_size,
+                                 lambda item: None)
+    print(f'  SIFT: workers={workers}, images/job={batch_size}, max_in_flight={max_in_flight}', flush=True)
+    results = extract_batches(batches, options, selected_device, threads, workers, max_in_flight)
+    completed = 0
+    for batch in results:
+        for index, keypoints, descriptors, scales, original_size in batch:
+            with h5py.File(path, 'a') as features:
+                group = features.create_group(names[index])
+                points = group.create_dataset('keypoints', data=keypoints.astype(np.float32))
+                points.attrs['uncertainty'] = float(scales.mean())
+                group.create_dataset('descriptors', data=descriptors.T.astype(np.float16))
+                group.create_dataset('scores', data=np.zeros(len(keypoints), dtype=np.float16))
+                group.create_dataset('image_size', data=original_size)
+            completed += 1
+            emit_progress('SIFT extraction', completed, len(dataset), 'images', work=True)
 
 
-def ensure_features(conf, scene, names, path, global_features=False, device='cpu', threads=1):
+def ensure_features(conf, scene, names, path, global_features=False, device='cpu', threads=1, batch_size=1, loader_workers=1, prefetch=4, workers=1, max_in_flight=1):
     import h5py
     from hloc import extract_features
     required = ('global_descriptor', 'image_size') if global_features else (
@@ -145,9 +140,10 @@ def ensure_features(conf, scene, names, path, global_features=False, device='cpu
         emit_progress('Global features' if global_features else 'Local features', unit='images', work=True)
         print(f'  Features: {len(missing)} pendientes / {len(names)}', flush=True)
         if conf['model']['name'] == 'dog' and conf['model'].get('descriptor') == 'sift':
-            extract_sift(conf, scene, missing, path, device=device, threads=threads)
+            extract_sift(conf, scene, missing, path, device=device, threads=threads, batch_size=batch_size, loader_workers=loader_workers, prefetch=prefetch, workers=workers, max_in_flight=max_in_flight)
         else:
-            extract_features.main(conf, scene, image_list=missing, feature_path=path)
+            runtime = dict(batch_size=batch_size, loader_workers=loader_workers, prefetch=prefetch, workers=workers, max_in_flight=max_in_flight)
+            extract_features.main(conf, scene, image_list=missing, feature_path=path, **runtime)
     else:
         print(f'  [CACHE] {path.name}', flush=True)
     # HLoc escribe cada imagen por separado; cualquier excepción detiene el pipeline.
@@ -226,7 +222,8 @@ def sequential_pairs(names, window):
     return sorted(pairs)
 
 
-def ensure_matches(conf, pairs, features_path, matches_path, device):
+def ensure_matches(conf, pairs, features_path, matches_path, device, batch_size=1, workers=1,
+                   loader_workers=1, prefetch=4, max_in_flight=1):
     """Una inferencia y escritura por vez; recicla pares, incluidos matches vacíos."""
     import h5py
     import numpy as np
@@ -252,29 +249,37 @@ def ensure_matches(conf, pairs, features_path, matches_path, device):
         return
     emit_progress('Matching', 0, len(missing), 'pairs', work=True)
     print(f'  Matching: {len(missing)} nuevos / {len(pairs)} pares', flush=True)
-    model = None
+    from .utils.batching import prefetched, compatible_batches, inference_jobs
+    if batch_size > 1 and conf['model']['name'] not in ('nearest_neighbor', 'superglue'):
+        raise ValueError('This matcher requires batch_size=1; independent workers are supported')
     dataset = match_features.FeaturePairsDataset(missing, features_path, features_path)
-    with torch.inference_mode():
-        for index, pair in enumerate(missing):
-            data = torch.utils.data.default_collate([dataset[index]])
-            count0, count1 = data['keypoints0'].shape[1], data['keypoints1'].shape[1]
-            if min(count0, count1) == 0:
-                with h5py.File(matches_path, 'a') as matches:
-                    group = matches.create_group(names_to_pair(*pair))
-                    group.create_dataset('matches0', data=np.full(count0, -1, dtype=np.int16))
-                    group.create_dataset('matching_scores0', data=np.zeros(count0, dtype=np.float16))
-            else:
-                if model is None:
-                    model = dynamic_load(matchers, conf['model']['name'])(conf['model']).eval().to(device)
-                data = {k: v if k.startswith('image') else v.to(device) for k, v in data.items()}
-                pred = model(data)
-                match_features.writer_fn((names_to_pair(*pair), pred), matches_path)
-                del pred
-            if (index + 1) % 100 == 0 or index + 1 == len(missing):
-                print(f'  Matches {index + 1}/{len(missing)}', flush=True)
-            emit_progress('Matching', index + 1, len(missing), 'pairs', work=True)
-            del data
-    del model
+    batches = compatible_batches(enumerate(prefetched(dataset, loader_workers, prefetch)), batch_size,
+        lambda item: tuple((k, tuple(v.shape)) for k, v in sorted(item[1].items())))
+    import threading
+    model_initialization = threading.Lock()
+    def infer(model, batch):
+        data = torch.utils.data.default_collate([item[1] for item in batch])
+        count0, count1 = data['keypoints0'].shape[1], data['keypoints1'].shape[1]
+        if min(count0, count1) == 0:
+            pred = {'matches0': torch.full((len(batch), count0), -1),
+                    'matching_scores0': torch.zeros(len(batch), count0)}
+        else:
+            data = {k: v if k.startswith('image') else v.to(device) for k, v in data.items()}
+            # Lazily build the model: empty pairs do not require weights.
+            if not model:
+                with model_initialization:
+                    model.append(dynamic_load(matchers, conf['model']['name'])(deepcopy(conf['model'])).eval().to(device))
+            pred = model[0](data)
+        return [(idx, {k: pred[k][row:row+1].detach().cpu()
+                       for k in ('matches0', 'matching_scores0')}) for row, (idx, _) in enumerate(batch)]
+    jobs = inference_jobs(list, infer, batches, workers, max_in_flight, device)
+    print(f'  Matching: batch_size={batch_size}, workers={workers}, max_in_flight={max_in_flight}', flush=True)
+    completed = 0
+    for results in jobs:
+        for index, pred in results:
+            match_features.writer_fn((names_to_pair(*missing[index]), pred), matches_path)
+            completed += 1
+            emit_progress('Matching', completed, len(missing), 'pairs', work=True)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -362,7 +367,7 @@ def run_scene(scene, args):
         global_id = config_id(global_conf)
         global_path = root / 'features' / f'global-{global_id}.h5'
         save_json(global_path.with_suffix('.json'), global_conf)
-        ensure_features(global_conf, scene, names, global_path, True)
+        ensure_features(global_conf, scene, names, global_path, True, **execution_options(args, 'global'))
         local_paths = {}
         for preset in args.configs:
             local_key, matcher_key = PRESETS[preset]
@@ -388,7 +393,7 @@ def run_scene(scene, args):
                 if local_id not in local_paths:
                     save_json(path.with_suffix('.json'), conf)
                     sift_device = args.sift_device or getattr(args, 'requested_device', args.device)
-                    ensure_features(conf, scene, names, path, device=sift_device, threads=args.threads)
+                    ensure_features(conf, scene, names, path, device=sift_device, threads=args.threads, **execution_options(args, 'local'))
                     local_paths[local_id] = path
             if args.until == 'features':
                 if dense:
@@ -423,13 +428,13 @@ def run_scene(scene, args):
                 match_id = local_id
                 match_path = root / 'dense_raw' / f'{match_id}.h5'
                 save_json(match_path.with_suffix('.json'), matcher_conf)
-                ensure_dense_raw(matcher_conf, scene, sorted(union), match_path, args.device)
+                ensure_dense_raw(matcher_conf, scene, sorted(union), match_path, args.device, **execution_options(args, 'dense'))
             else:
                 matcher_conf = deepcopy(match_features.confs[matcher_key])
                 match_id = digest({'local': local_id, 'matcher': config_id(matcher_conf)})
                 match_path = root / 'matches' / f'{match_id}.h5'
                 save_json(match_path.with_suffix('.json'), {'local': local_id, 'matcher': matcher_conf})
-                ensure_matches(matcher_conf, sorted(union), path, match_path, args.device)
+                ensure_matches(matcher_conf, sorted(union), path, match_path, args.device, **execution_options(args, 'matching'))
             if args.until == 'matches' and not dense:
                 continue
             run_id = digest({'matches': match_id, 'retrieval': retrieval_id, 'seed': args.seed,
@@ -470,6 +475,10 @@ def build_parser():
     parser.add_argument('--top-k', type=int, default=20)
     parser.add_argument('--sequential-window', type=int, default=0,
                         help='Añadir pares con las siguientes N muestras de cada video; 0 desactiva')
+    parser.add_argument('--local-batch-size', type=int, default=1)
+    parser.add_argument('--dense-batch-size', type=int, default=1)
+    parser.add_argument('--loader-workers', type=int, default=1)
+    parser.add_argument('--prefetch', type=int, default=4)
     parser.add_argument('--query-batch', type=int, default=32)
     parser.add_argument('--database-batch', type=int, default=512)
     parser.add_argument('--resize-max', type=int, default=1024)
@@ -488,6 +497,15 @@ def build_parser():
 def validate(args, parser):
     """Valida argumentos y devuelve la lista de escenas."""
     args.requested_device = args.device
+    for key in ('local_batch_size', 'dense_batch_size', 'prefetch', 'loader_workers'):
+        value = getattr(args, key)
+        if type(value) is not int or value < (0 if key == 'loader_workers' else 1):
+            parser.error(f'{key} has an invalid value')
+    validate_execution(getattr(args, 'execution', {}))
+    if execution_options(args, 'global')['batch_size'] > 1 and args.global_feature != 'netvlad':
+        parser.error('This global extractor requires execution.global.batch_size=1; workers may be increased')
+    if 'sp-lg' in args.configs and execution_options(args, 'matching')['batch_size'] > 1:
+        parser.error('LightGlue requires execution.matching.batch_size=1; workers may be increased')
     for name in ('top_k', 'query_batch', 'database_batch', 'resize_max', 'max_keypoints', 'threads'):
         if getattr(args, name) < 1:
             parser.error(f'{name} debe ser positivo')

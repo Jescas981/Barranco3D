@@ -1,3 +1,4 @@
+from .execution import execution_options
 """Tareas atómicas: pares, banco por experimento y worker de SfM."""
 from .utils.progress import report as emit_progress
 
@@ -68,7 +69,7 @@ def stage_pairs(scene, args):
         gid = config_id(env, gconf)
         gpath = root / 'features' / f'global-{gid}.h5'
         save_json(gpath.with_suffix('.json'), gconf)
-        ensure_features(gconf, scene, names, gpath, True)
+        ensure_features(gconf, scene, names, gpath, True, **execution_options(args, 'global'))
 
         rid = digest({'global': gid, 'top_k': args.top_k, 'sequential_window': args.sequential_window})
         pair_root = root / 'pairs' / rid
@@ -132,7 +133,7 @@ def bank_preset(scene, args, preset):
             match_id = config_id(env, {'dense': matcher_conf, 'matcher_code': code})
             match_path = root / 'dense_raw' / f'{match_id}.h5'
             save_json(match_path.with_suffix('.json'), matcher_conf)
-            ensure_dense_raw(matcher_conf, scene, union, match_path, args.device)
+            ensure_dense_raw(matcher_conf, scene, union, match_path, args.device, **execution_options(args, 'dense'))
             if masked:
                 match_path = filter_dense(match_path, match_path.with_name(match_id + '-masked.h5'),
                                           original_scene, union, regions)
@@ -148,7 +149,8 @@ def bank_preset(scene, args, preset):
             features = root / 'features' / f'local-{local_id}.h5'
             save_json(features.with_suffix('.json'), conf)
             ensure_features(conf, scene, names, features,
-                            device=args.sift_device or args.requested_device, threads=args.threads)
+                            device=args.sift_device or args.requested_device, threads=args.threads,
+                            **execution_options(args, 'local'))
             if masked:
                 features = filter_features(features, features.with_name(local_id + '-masked.h5'),
                                            original_scene, names, regions)
@@ -156,7 +158,7 @@ def bank_preset(scene, args, preset):
             match_id = digest({'local': local_id, 'matcher': config_id(env, matcher_conf)})
             match_path = root / 'matches' / f'{match_id}.h5'
             save_json(match_path.with_suffix('.json'), {'local': local_id, 'matcher': matcher_conf})
-            ensure_matches(matcher_conf, union, features, match_path, args.device)
+            ensure_matches(matcher_conf, union, features, match_path, args.device, **execution_options(args, 'matching'))
 
         base = {'matches': match_id, 'retrieval': index['retrieval_id'], 'seed': args.seed,
                 'camera_mode': args.camera_mode,

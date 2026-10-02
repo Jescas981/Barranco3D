@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 from lima3d.region_editor import save_selection, validate_selection, video_info, frame_png
 from lima3d.regions import parse_regions, effective_regions, prepared_scene, mask_path, region_identity
 from lima3d.artifacts import portable_context
-spec = importlib.util.spec_from_file_location('frame_extractor_for_editor', ROOT/'extract_colmap_frames.py')
+spec = importlib.util.spec_from_file_location('frame_extractor_for_editor', ROOT/'extract_frames.py')
 extractor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(extractor)
 

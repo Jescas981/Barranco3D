@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extrae una escena de videos a un proyecto COLMAP, usando FFmpeg en serie."""
+"""Extract scene videos for COLMAP using fixed FPS, optical flow, or hybrid selection."""
 import argparse
 from fractions import Fraction
 import json
@@ -36,7 +36,7 @@ def plan_scene(scene, groups, fps):
         if groups and relative.parts[0] not in groups:
             continue
         info = probe_video(video)
-        if info['source_fps'] and fps > info['source_fps'] + 1e-6:
+        if fps is not None and info['source_fps'] and fps > info['source_fps'] + 1e-6:
             raise ValueError(f'{relative}: FPS solicitados ({fps}) mayores que los originales ({info["source_fps"]:.3f})')
         # Reflejar exactamente las carpetas de plataformas/cámaras de entrada.
         folder = relative.parent
@@ -89,8 +89,9 @@ within each folder. No synchronized camera rig is assumed.
 `extraction.json` records source videos, FPS, frame counts, and available clip
 metadata. `image_list.txt` contains paths relative to the scene's image root.
 Names include the source video and a zero-based sample index, not the original
-frame index. Each clip is sampled independently using timestamps; variable-rate
-video can produce repeated images. Clip metadata does not imply synchronization.
+frame index. Fixed-FPS sampling uses timestamps; variable-rate video can produce
+repeated images. Optical-flow selection logs original indices and statistics under
+`flow/`, comparing against the last selected frame. Each clip is independent. Clip metadata does not imply synchronization.
 
 Encoded dimensions are preserved without automatic rotation or resizing.
 JPEG uses high quality; PNG avoids additional compression loss.
@@ -98,10 +99,17 @@ Exhaustive matching can be expensive for large image collections.
 """)
 
 
-def extract_scene(scene, output, fps, groups=None, image_format='jpg', threads=1, dry_run=False, regions=None):
+def extract_scene(scene, output, fps, groups=None, image_format='jpg', threads=1, dry_run=False, regions=None,
+                  strategy="fps", optical_flow=None):
     scene, output = Path(scene).resolve(), Path(output).resolve()
     regions = regions or {}
-    if not math.isfinite(fps) or fps <= 0:
+    from lima3d.optical_flow import validate_options
+    if strategy not in ('fps', 'optical_flow', 'hybrid'):
+        raise ValueError('strategy must be fps, optical_flow or hybrid')
+    optical_flow = validate_options(optical_flow)
+    if strategy == 'optical_flow':
+        fps = None
+    elif isinstance(fps, bool) or not isinstance(fps, (int, float)) or not math.isfinite(fps) or fps <= 0:
         raise ValueError('FPS debe ser finito y mayor que cero')
     if threads < 1:
         raise ValueError('threads debe ser >= 1')
@@ -132,9 +140,17 @@ def extract_scene(scene, output, fps, groups=None, image_format='jpg', threads=1
             with Image.open(region['path']) as mask:
                 if mask.size != (entry['width'], entry['height']):
                     raise ValueError(f'Mask dimensions differ from video: {entry["relative_video"]}')
+        if strategy in ('optical_flow', 'hybrid'):
+            if region['mode'] == 'mask' and 'path' not in region:
+                raise ValueError('Optical flow requires a shared camera mask path, not a per-image mask root')
+            if min(entry.get('output_width', entry['width']), entry.get('output_height', entry['height'])) < optical_flow['block_size']:
+                raise ValueError(f'block_size exceeds video/crop dimensions: {entry["relative_video"]}')
     if any(Path(p['image_folder']).parts and Path(p['image_folder']).parts[0] == '_colmap' for p in plan):
         raise ValueError('El nombre _colmap está reservado para metadatos de salida')
-    print(f'Escena: {scene.name} | videos: {len(plan)} | FPS: {fps:g}')
+    sampling = f'FPS: {fps:g}' if strategy == 'fps' else f'Optical flow | Mth: {optical_flow["mode_threshold_px"]:g} px'
+    if strategy == 'hybrid':
+        sampling = f'Hybrid | Mth: {optical_flow["mode_threshold_px"]:g} px | Fallback: {fps:g} FPS ({1/fps:g} s)'
+    print(f'Escena: {scene.name} | videos: {len(plan)} | {sampling}')
     for entry in plan:
         print(f'  {entry["relative_video"]} -> {output / entry["image_folder"]}')
     if dry_run:
@@ -145,6 +161,7 @@ def extract_scene(scene, output, fps, groups=None, image_format='jpg', threads=1
     project.mkdir()
     (project / 'sparse').mkdir()
     metadata = {'scene': str(scene), 'requested_fps': fps, 'format': image_format,
+                'strategy': strategy, 'optical_flow': optical_flow if strategy in ('optical_flow', 'hybrid') else None,
                 'status': 'in_progress', 'videos': plan, 'source_regions': regions,
                 'applied_regions': {entry['image_folder']: entry['region'] for entry in plan
                                     if entry['region']['mode'] == 'crop'}}
@@ -155,21 +172,30 @@ def extract_scene(scene, output, fps, groups=None, image_format='jpg', threads=1
             for index, entry in enumerate(plan, 1):
                 folder = output / entry['image_folder']
                 folder.mkdir(parents=True, exist_ok=True)
-                # image2 interpreta % como patrón; escapar los % del nombre/ruta.
-                pattern = str(folder / entry['prefix']).replace('%', '%%') + f'__%06d.{image_format}'
-                filters = f'fps=fps={fps:.12g}:start_time=0:round=near'
-                if entry['region']['mode'] == 'crop':
-                    left, top, right, bottom = entry['region']['box']
-                    filters += f',crop=w={right-left}:h={bottom-top}:x={left}:y={top}:exact=1'
-                command = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-n',
-                           '-threads', str(threads), '-noautorotate', '-i', entry['video'],
-                           '-map', '0:v:0', '-an', '-sn', '-dn', '-filter_threads', str(threads),
-                           '-vf', filters,
-                           '-threads', str(threads), '-start_number', '0']
-                command += ['-q:v', '2'] if image_format == 'jpg' else ['-compression_level', '1']
-                command += [pattern]
-                print(f'[{index}/{len(plan)}] Extrayendo {entry["relative_video"]}', flush=True)
-                subprocess.run(command, check=True)
+                print(f'[{index}/{len(plan)}] Extracting {entry["relative_video"]}', flush=True)
+                if strategy in ('optical_flow', 'hybrid'):
+                    from lima3d.optical_flow import select_video
+                    log_path = project / 'flow' / entry['image_folder'] / (entry['prefix'] + '.jsonl')
+                    entry['flow_selection'] = select_video(entry['video'], folder, entry['prefix'],
+                        image_format, optical_flow, threads, entry['region'], log_path,
+                        fallback_fps=fps if strategy == 'hybrid' else None)
+                    entry['flow_selection']['selection_log'] = log_path.relative_to(output).as_posix()
+                else:
+                    # image2 interpreta % como patrón; escapar los % del nombre/ruta.
+                    pattern = str(folder / entry['prefix']).replace('%', '%%') + f'__%06d.{image_format}'
+                    filters = f'fps=fps={fps:.12g}:start_time=0:round=near'
+                    if entry['region']['mode'] == 'crop':
+                        left, top, right, bottom = entry['region']['box']
+                        filters += f',crop=w={right-left}:h={bottom-top}:x={left}:y={top}:exact=1'
+                    command = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-n',
+                               '-threads', str(threads), '-noautorotate', '-i', entry['video'],
+                               '-map', '0:v:0', '-an', '-sn', '-dn', '-filter_threads', str(threads),
+                               '-vf', filters,
+                               '-threads', str(threads), '-start_number', '0']
+                    command += ['-q:v', '2'] if image_format == 'jpg' else ['-compression_level', '1']
+                    command += [pattern]
+                    print(f'[{index}/{len(plan)}] Extrayendo {entry["relative_video"]}', flush=True)
+                    subprocess.run(command, check=True)
                 images = sorted(p for p in folder.iterdir()
                                 if p.name.startswith(entry['prefix'] + '__') and p.suffix == '.' + image_format)
                 if not images:
@@ -204,12 +230,14 @@ def extract_scene(scene, output, fps, groups=None, image_format='jpg', threads=1
 
 def main(argv=None):
     from lima3d.extraction_config import extraction_jobs
-    parser = argparse.ArgumentParser(description='Extract scene frames using FFmpeg and config.yaml.')
+    parser = argparse.ArgumentParser(description='Extract scene frames using fps, optical_flow, or hybrid strategies from config.yaml.')
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument('scene', nargs='?', type=Path, help='Scene name or input path (legacy CLI)')
     selection.add_argument('--scenes', nargs='+', help='Override data.scenes')
     parser.add_argument('--config', type=Path, help='Shared YAML; defaults to config.yaml when no scene is given')
-    parser.add_argument('--fps', type=float, help='Override extraction.fps')
+    parser.add_argument('--strategy', choices=['fps', 'optical_flow', 'hybrid'], help='Override extraction.strategy')
+    parser.add_argument('--mode-threshold-px', type=float, help='Modal displacement threshold in pixels (optical_flow or hybrid)')
+    parser.add_argument('--fps', type=float, help='Sampling FPS, or temporal fallback rate for hybrid')
     parser.add_argument('--output', type=Path, help='Output directory for a single scene')
     parser.add_argument('--groups', nargs='+', help='Override data.platforms')
     parser.add_argument('--format', choices=['jpg', 'png'], help='Override extraction.format')

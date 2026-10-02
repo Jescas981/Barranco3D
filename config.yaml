@@ -3,14 +3,22 @@ data:
   frames_root: frames
   output_root: outputs/coalitions
   scenes: null                  # null = all scenes under the input root of each stage
-  # platforms: [Car, Drone, Pedestrian]
-  platforms: [Car]
+  platforms: [Car, Drone, Pedestrian]
+  # platforms: [Drone]
   device: auto                  # auto | cpu | cuda
 
-extraction:
-  fps: 2
-  format: jpg                  # jpg | png
-  threads: 1                   # FFmpeg threads; videos are processed sequentially
+# extraction:
+#   strategy: fps                # fps | optical_flow | hybrid
+#   optical_flow:
+#     mode_threshold_px: 80      # Select when modal displacement from last selected frame >= Mth
+#     mode_bin_width_px: 1       # Histogram bin width; zero displacement stays zero
+#     block_size: 180
+#     block_stride: 270
+#     search_radius: 300         # Search +/- this many original-resolution pixels on each axis
+#     keep_last: true            # Always include the final frame, even below Mth
+#   fps: 2                      # Fixed sampling, or hybrid fallback after 1/fps video seconds
+#   format: jpg                  # jpg | png
+#   threads: 1                   # FFmpeg threads; videos are processed sequentially
 
 resources:
   bank:                         # pairs + matching bank (GPU)
@@ -25,12 +33,16 @@ resources:
 
 mvs:
   enabled: true
-  colmap: colmap
   max_image_size: 1024
   cache_gb: 2.0
   num_sources: 10
 
 defaults:
+  execution:                  # Override any operation inside an experiment
+    global: {batch_size: 1, workers: 1, loader_workers: 2, prefetch: 8}
+    local: {batch_size: 1, workers: 1, loader_workers: 2, prefetch: 8}
+    matching: {batch_size: 1, workers: 1, loader_workers: 2, prefetch: 8}
+    dense: {batch_size: 1, workers: 1, loader_workers: 2, prefetch: 8}
   global_feature: netvlad
   top_k: 20
   sequential_window: 0

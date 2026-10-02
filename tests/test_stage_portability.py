@@ -101,7 +101,7 @@ class PortabilityTests(unittest.TestCase):
             root=Path(tmp)/'machine1'; scene=make_scene(root)
             args=arguments(root)
             calls=[]
-            def fake_global(conf, scene, image_list, feature_path):
+            def fake_global(conf, scene, image_list, feature_path, **kwargs):
                 calls.append(list(image_list))
                 with h5py.File(feature_path,'a') as f:
                     for i,name in enumerate(image_list):

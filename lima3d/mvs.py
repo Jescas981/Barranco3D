@@ -3,16 +3,70 @@
 from .utils.progress import report as emit_progress
 
 import argparse
+from contextlib import contextmanager
+import sys
+import traceback
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
-import shutil
-import subprocess
 import time
 from .utils.io import digest, save_json, scene_lock
 from .artifacts import file_hash
+
+
+def load_pycolmap():
+    try:
+        import pycolmap
+    except ImportError as exc:
+        raise RuntimeError('MVS requiere pycolmap con CUDA; instala pycolmap-cuda en este entorno') from exc
+    required = ('undistort_images', 'patch_match_stereo', 'stereo_fusion')
+    if not getattr(pycolmap, 'has_cuda', False) or any(not hasattr(pycolmap, name) for name in required):
+        raise RuntimeError('MVS requiere pycolmap con CUDA y las APIs de reconstrucción densa; instala pycolmap-cuda')
+    return pycolmap
+
+
+@contextmanager
+def stage_runtime(log_path, threads):
+    """Capturar también logs C++ y restaurar recursos al terminar o fallar.
+
+    MVS se ejecuta en un worker dedicado: la redirección de descriptores y
+    el entorno son locales a ese proceso, no seguros para llamadas concurrentes.
+    """
+    affinity = os.sched_getaffinity(0) if hasattr(os, 'sched_getaffinity') else None
+    keys = ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS')
+    previous = {key: os.environ.get(key) for key in keys}
+    saved = []
+    with log_path.open('a') as log:
+        try:
+            for stream in (sys.stdout, sys.stderr):
+                stream.flush()
+            for fd in (1, 2):
+                saved.append((fd, os.dup(fd)))
+                os.dup2(log.fileno(), fd)
+            for key in keys:
+                os.environ[key] = str(threads)
+            if affinity:
+                os.sched_setaffinity(0, sorted(affinity)[:threads])
+            try:
+                yield
+            except BaseException:
+                traceback.print_exc(file=log)
+                raise
+        finally:
+            for stream in (sys.stdout, sys.stderr):
+                stream.flush()
+            for fd, original in saved:
+                os.dup2(original, fd)
+                os.close(original)
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            if affinity:
+                os.sched_setaffinity(0, affinity)
 
 
 def model_files(model):
@@ -105,14 +159,12 @@ def ply_valid(path):
     return False
 
 
-def run_mvs(model, images, output=None, *, colmap='colmap', max_image_size=1024,
+def run_mvs(model, images, output=None, *, max_image_size=1024,
             cache_gb=2.0, threads=2, gpu_index='0', num_sources=10, dry_run=False):
     model, images = Path(model).resolve(), Path(images).resolve()
     if max_image_size < 1 or threads < 1 or num_sources < 1 or not math.isfinite(cache_gb) or cache_gb <= 0:
         raise ValueError('Tamaños, threads, fuentes y caché deben ser positivos')
-    binary = shutil.which(colmap)
-    if not binary:
-        raise ValueError(f'No se encuentra COLMAP: {colmap}')
+    pycolmap = load_pycolmap()
     names = read_names(model)
     image_state = []
     for name in names:
@@ -126,7 +178,8 @@ def run_mvs(model, images, output=None, *, colmap='colmap', max_image_size=1024,
     config = {'version': 2, 'model_hash': model_signature(model),
               'image_state': digest(image_state), 'max_image_size': max_image_size,
               'num_sources': num_sources}
-    runtime = {'model': str(model), 'images': str(images), 'colmap': binary,
+    runtime = {'model': str(model), 'images': str(images), 'backend': 'pycolmap',
+               'pycolmap_version': pycolmap.__version__,
                'threads': threads, 'cache_gb': cache_gb, 'gpu_index': gpu_index}
     output = Path(output).resolve() if output else model.parent / 'mvs' / f'{model.name}-{digest(config)}'
     if output == model or output == images or model.is_relative_to(output) or images.is_relative_to(output):
@@ -149,20 +202,29 @@ def run_mvs(model, images, output=None, *, colmap='colmap', max_image_size=1024,
         state['runtime'] = runtime
         workspace = output / 'workspace'
         fused = workspace / 'fused.ply'
-        undistort = [binary, 'image_undistorter', '--image_path', str(images),
-                     '--input_path', str(model), '--output_path', str(workspace),
-                     '--output_type', 'COLMAP', '--max_image_size', str(max_image_size),
-                     '--num_patch_match_src_images', str(num_sources)]
-        stereo = [binary, 'patch_match_stereo', '--workspace_path', str(workspace),
-                  '--workspace_format', 'COLMAP', '--PatchMatchStereo.gpu_index', str(gpu_index),
-                  '--PatchMatchStereo.max_image_size', str(max_image_size),
-                  '--PatchMatchStereo.geom_consistency', '1',
-                  '--PatchMatchStereo.cache_size', str(cache_gb)]
-        fuse = [binary, 'stereo_fusion', '--workspace_path', str(workspace),
-                '--workspace_format', 'COLMAP', '--input_type', 'geometric',
-                '--output_path', str(fused), '--StereoFusion.num_threads', str(threads),
-                '--StereoFusion.max_image_size', str(max_image_size),
-                '--StereoFusion.use_cache', '1', '--StereoFusion.cache_size', str(cache_gb)]
+        def undistort():
+            pycolmap.undistort_images(
+                output_path=str(workspace), input_path=str(model), image_path=str(images),
+                output_type='COLMAP', num_patch_match_src_images=num_sources,
+                undistort_options=pycolmap.UndistortCameraOptions(max_image_size=max_image_size))
+
+        def stereo():
+            pycolmap.patch_match_stereo(
+                workspace_path=str(workspace), workspace_format='COLMAP',
+                options=pycolmap.PatchMatchOptions(
+                    gpu_index=str(gpu_index), max_image_size=max_image_size,
+                    geom_consistency=True, cache_size=cache_gb))
+
+        def fuse():
+            # Nuevas versiones permiten bin/txt/ply y ya no usan PLY por defecto.
+            output_options = ({'output_type': 'ply'}
+                              if 'output_type' in (pycolmap.stereo_fusion.__doc__ or '') else {})
+            pycolmap.stereo_fusion(
+                output_path=str(fused), workspace_path=str(workspace),
+                workspace_format='COLMAP', input_type='geometric',
+                options=pycolmap.StereoFusionOptions(
+                    num_threads=threads, max_image_size=max_image_size,
+                    use_cache=True, cache_size=cache_gb), **output_options)
         def undistorted():
             return all(nonempty(workspace / 'images' / name) for name in names) and all(
                 nonempty(workspace / 'sparse' / f'{part}.bin') for part in ('cameras','images','points3D')) and nonempty(workspace/'stereo/patch-match.cfg')
@@ -171,13 +233,6 @@ def run_mvs(model, images, output=None, *, colmap='colmap', max_image_size=1024,
                        for name in names for kind in ('depth_maps', 'normal_maps'))
         validators = {'undistort': undistorted, 'stereo': maps, 'fusion': lambda: ply_valid(fused)}
         steps = [('undistort', undistort), ('stereo', stereo), ('fusion', fuse)]
-        # Ejecutar con cuota de CPU local al subproceso, sin cambiar la afinidad del padre.
-        env = os.environ.copy()
-        env.update(OMP_NUM_THREADS=str(threads), OPENBLAS_NUM_THREADS=str(threads))
-        affinity = sorted(os.sched_getaffinity(0))[:threads] if hasattr(os, 'sched_getaffinity') else None
-        def limit_cpu():
-            if affinity:
-                os.sched_setaffinity(0, affinity)
         dirty = False
         try:
             for step, command in steps:
@@ -208,9 +263,8 @@ def run_mvs(model, images, output=None, *, colmap='colmap', max_image_size=1024,
                 save_json(state_path, state)
                 emit_progress(f'MVS: {step}', work=True)
                 print(f'  [RUN] MVS {step}', flush=True)
-                with (output / f'{step}.log').open('a') as log:
-                    subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT,
-                                   env=env, preexec_fn=limit_cpu if affinity else None)
+                with stage_runtime(output / f'{step}.log', threads):
+                    command()
                 if not validators[step]():
                     raise RuntimeError(f'MVS {step} terminó sin salidas completas; revisa {output / (step + ".log")}')
                 state['steps'][step] = 'complete'
@@ -263,7 +317,6 @@ def main():
     parser.add_argument('--output', type=Path, help='Solo con --model-path; por defecto carpeta MVS independiente')
     parser.add_argument('--configs', nargs='+')
     parser.add_argument('--coalitions', nargs='+')
-    parser.add_argument('--colmap', default='colmap')
     parser.add_argument('--max-image-size', type=int, default=1024)
     parser.add_argument('--cache-gb', type=float, default=2.0)
     parser.add_argument('--threads', type=int, default=2)
@@ -284,7 +337,7 @@ def main():
     if not jobs:
         print('No hay reconstrucciones SfM terminadas para MVS')
     for model, images in jobs:
-        run_mvs(model, images, args.output, colmap=args.colmap, max_image_size=args.max_image_size,
+        run_mvs(model, images, args.output, max_image_size=args.max_image_size,
                 cache_gb=args.cache_gb, threads=args.threads, gpu_index=args.gpu_index,
                 num_sources=args.num_sources, dry_run=args.dry_run)
 

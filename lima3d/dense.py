@@ -21,7 +21,7 @@ def raw_valid(group):
     return len(n) == 1 and group['keypoints0'].shape == group['keypoints1'].shape == (n[0], 2)
 
 
-def ensure_dense_raw(conf, scene, pairs, path, device):
+def ensure_dense_raw(conf, scene, pairs, path, device, batch_size=1, loader_workers=1, prefetch=4, workers=1, max_in_flight=1):
     import h5py
     import numpy as np
     import torch
@@ -43,14 +43,24 @@ def ensure_dense_raw(conf, scene, pairs, path, device):
         return
     emit_progress('MASt3R inference', 0, len(pending), 'pairs', work=True)
     print(f'  MASt3R {conf["model"]["weights"]}: {len(pending)} pares nuevos', flush=True)
-    model = dynamic_load(matchers, 'mast3r')(conf['model']).eval().to(device)
     dataset = ImagePairDataset(scene, conf['preprocessing'], pending)
-    with torch.inference_mode():
-        for index in range(len(dataset)):
-            image0, image1, scale0, scale1, name0, name1 = dataset[index]
-            # HLoc entrega [0,1]; la implementación MASt3R original usa [-1,1].
-            pred = model({'image0': (image0[None].to(device) * 2 - 1),
-                          'image1': (image1[None].to(device) * 2 - 1)})
+    from .utils.batching import prefetched, compatible_batches
+    batches = compatible_batches(prefetched(dataset, loader_workers, prefetch), batch_size,
+                                 lambda item: (tuple(item[0].shape), tuple(item[1].shape)))
+    print(f'  MASt3R: batch_size={batch_size}, workers={workers}, max_in_flight={max_in_flight}, loader_workers={loader_workers}, prefetch={prefetch}', flush=True)
+    from copy import deepcopy
+    from .utils.batching import inference_jobs
+    def infer(model, batch):
+        inputs = {'image0': torch.stack([item[0] for item in batch]).to(device) * 2 - 1,
+                  'image1': torch.stack([item[1] for item in batch]).to(device) * 2 - 1}
+        predictions = [model(inputs)] if len(batch) == 1 else model.forward_batch(inputs)
+        return batch, [{key: value.detach().cpu() for key, value in pred.items()} for pred in predictions]
+    jobs = inference_jobs(lambda: dynamic_load(matchers, 'mast3r')(deepcopy(conf['model'])).eval().to(device),
+                          infer, batches, workers, max_in_flight, device)
+    completed = 0
+    for batch, predictions in jobs:
+        for item, pred in zip(batch, predictions):
+            _, _, scale0, scale1, name0, name1 = item
             k0 = (pred['keypoints0'].detach().cpu().numpy() + 0.5) * scale0 - 0.5
             k1 = (pred['keypoints1'].detach().cpu().numpy() + 0.5) * scale1 - 0.5
             scores = pred['scores'].detach().cpu().numpy()
@@ -60,12 +70,9 @@ def ensure_dense_raw(conf, scene, pairs, path, device):
                 group.create_dataset('keypoints0', data=k0[valid].astype(np.float32))
                 group.create_dataset('keypoints1', data=k1[valid].astype(np.float32))
                 group.create_dataset('scores', data=scores[valid].astype(np.float32))
-                handle.flush()
-            del pred, image0, image1
-            if (index + 1) % 10 == 0 or index + 1 == len(dataset):
-                print(f'  MASt3R {index + 1}/{len(dataset)}', flush=True)
-            emit_progress('MASt3R inference', index + 1, len(dataset), 'pairs', work=True)
-    del model
+            completed += 1
+        del predictions
+        emit_progress('MASt3R inference', completed, len(dataset), 'pairs', work=True)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
